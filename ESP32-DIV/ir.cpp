@@ -2258,6 +2258,22 @@ static void loadBuiltinProfiles() {
     s_profiles.push_back(p);
   }
 
+{
+    Profile p{};
+    p.name = "Roku";
+    p.proto = decode_type_t::NEC;
+    p.bits = 32;
+    p.code[Power] = 0x5743C03F; p.has[Power] = true;
+    p.code[Mute]  = 0x57438679; p.has[Mute]  = true;
+    p.code[Up]    = 0x57439867; p.has[Up]    = true;
+    p.code[Down]  = 0x5743CC33; p.has[Down]  = true;
+    p.code[Left]  = 0x57437887; p.has[Left]  = true;
+    p.code[Right] = 0x5743B44B; p.has[Right] = true;
+    p.code[Ok]    = 0x574354AB; p.has[Ok]    = true; 
+    p.code[Back]  = 0x57436699; p.has[Back]  = true;
+    s_profiles.push_back(p);
+  }
+
   {
     Profile p{};
     p.name = "Sony TV (common)";
