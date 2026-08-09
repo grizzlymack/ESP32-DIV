@@ -17,6 +17,7 @@ When using Arduino IDE for uploading the code, make sure to install the correct 
 	arduinoFFT@^1.6.1           https://github.com/kosme/arduinoFFT/archive/refs/tags/v1.6.1.zip
 	SmartRC CC1101 Driver Lib   Use .zip file (uncompressed)
 	Adafruit NeoPixel@^1.12.3   https://github.com/adafruit/Adafruit_NeoPixel/archive/refs/tags/1.12.2.zip
+	Adafruit BusIO@^1.17.4      https://github.com/adafruit/Adafruit_BusIO/archive/refs/tags/1.17.4.zip
 
 Dependancies can either be installed directly via the Arduino IDE app's Library Manager or by downloading each file and placing them in the correct directory depending on the OS used:
   MacOS:   ~/Documents/Arduino/libraries/
