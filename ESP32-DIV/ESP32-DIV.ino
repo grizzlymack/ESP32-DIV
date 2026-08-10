@@ -167,12 +167,14 @@ const char *gps_submenu_items[gps_NUM_SUBMENU_ITEMS] = {
     "Satellite Scanner",
     "Back to Main Menu"};
 
-const int ir_NUM_SUBMENU_ITEMS = 4;
+const int ir_NUM_SUBMENU_ITEMS = 5;
 const char *ir_submenu_items[ir_NUM_SUBMENU_ITEMS] = {
     "Record",
     "Saved Profile",
     "Universal Controller",
+    "Copy Controller", 
     "Back to Main Menu"};
+
 
 const int about_NUM_SUBMENU_ITEMS = 1;
 const char *about_submenu_items[about_NUM_SUBMENU_ITEMS] = {
@@ -296,6 +298,7 @@ const unsigned char *ir_submenu_icons[ir_NUM_SUBMENU_ITEMS] = {
     bitmap_icon_led,
     bitmap_icon_list,
     bitmap_icon_remote_control,
+    bitmap_icon_follow, 
     bitmap_icon_go_back
 };
 
@@ -3978,6 +3981,38 @@ void handleOtherSubmenuButtons() {
                     displaySubmenu();
                     delay(200);
                 }
+            } else if (current_submenu_index == 3) { 
+                current_submenu_index = 3;
+                in_sub_menu = true;
+                feature_active = true;
+                feature_exit_requested = false;
+                IRCopyController::setup();
+                while (current_submenu_index == 3 && !feature_exit_requested) {
+                    current_submenu_index = 3;
+                    in_sub_menu = true;
+                    IRCopyController::loop();
+                    if (featureExitButtonPressed()) {
+                        in_sub_menu = true;
+                        is_main_menu = false;
+                        submenu_initialized = false;
+                        feature_active = false;
+                        feature_exit_requested = false;
+                        displaySubmenu();
+                        delay(200);
+                        while (featureExitButtonPressed()) {
+                        }
+                        break;
+                    }
+                }
+                if (feature_exit_requested) {
+                    in_sub_menu = true;
+                    is_main_menu = false;
+                    submenu_initialized = false;
+                    feature_active = false;
+                    feature_exit_requested = false;
+                    displaySubmenu();
+                    delay(200);
+                }
             }
         } else if (other_layer == OTHER_LAYER_RFID) {
             if (current_submenu_index == rfid_NUM_SUBMENU_ITEMS - 1) {
@@ -4173,6 +4208,38 @@ void handleOtherSubmenuButtons() {
                     current_submenu_index = 2;
                     in_sub_menu = true;
                     IRUniversalController::loop();
+                    if (featureExitButtonPressed()) {
+                        in_sub_menu = true;
+                        is_main_menu = false;
+                        submenu_initialized = false;
+                        feature_active = false;
+                        feature_exit_requested = false;
+                        displaySubmenu();
+                        delay(200);
+                        while (featureExitButtonPressed()) {
+                        }
+                        break;
+                    }
+                }
+                if (feature_exit_requested) {
+                    in_sub_menu = true;
+                    is_main_menu = false;
+                    submenu_initialized = false;
+                    feature_active = false;
+                    feature_exit_requested = false;
+                    displaySubmenu();
+                    delay(200);
+                }
+            } else if (current_submenu_index == 3) {
+                current_submenu_index = 3;
+                in_sub_menu = true;
+                feature_active = true;
+                feature_exit_requested = false;
+                IRCopyController::setup();
+                while (current_submenu_index == 3 && !feature_exit_requested) {
+                    current_submenu_index = 3;
+                    in_sub_menu = true;
+                    IRCopyController::loop();
                     if (featureExitButtonPressed()) {
                         in_sub_menu = true;
                         is_main_menu = false;
