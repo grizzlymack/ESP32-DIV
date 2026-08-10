@@ -2060,6 +2060,7 @@ struct Profile {
   String name;
   String category;
   String brand;
+  String source;
   decode_type_t proto = decode_type_t::UNKNOWN;
   uint16_t bits = 0;
   // Keep as 64-bit so we can support protocols like RC6 (36-bit), Panasonic (48-bit),
@@ -2221,6 +2222,7 @@ static void loadBuiltinProfiles() {
   {
     Profile p{};
     p.name = "Samsung TV (common)";
+    p.source = "built-in";
     p.proto = decode_type_t::SAMSUNG36;
     p.bits = 32;
     p.code[Power] = 0xE0E040BFu; p.has[Power] = true;
@@ -2241,6 +2243,7 @@ static void loadBuiltinProfiles() {
   {
     Profile p{};
     p.name = "LG TV (common)";
+    p.source = "built-in";
     p.proto = decode_type_t::NEC;
     p.bits = 32;
     p.code[Power] = 0x20DF10EFu; p.has[Power] = true;
@@ -2261,6 +2264,7 @@ static void loadBuiltinProfiles() {
 {
     Profile p{};
     p.name = "Roku";
+    p.source = "built-in";
     p.proto = decode_type_t::NEC;
     p.bits = 32;
     p.code[Power] = 0x5743C03F; p.has[Power] = true;
@@ -2277,6 +2281,7 @@ static void loadBuiltinProfiles() {
   {
     Profile p{};
     p.name = "Sony TV (common)";
+    p.source = "built-in";
     p.proto = decode_type_t::SONY;
     p.bits = 12;
     p.code[Power] = 0x0A90u; p.has[Power] = true;
@@ -2291,6 +2296,7 @@ static void loadBuiltinProfiles() {
   {
     Profile p{};
     p.name = "Xbox 360";
+    p.source = "built-in";
     p.proto = decode_type_t::RC6;
     p.bits = 36;
     p.code[Power] = 0x0C800F740Cu; p.has[Power] = true;  
@@ -2300,6 +2306,7 @@ static void loadBuiltinProfiles() {
   {
     Profile p{};
     p.name = "Epson Projector";
+    p.source = "built-in";
     p.proto = decode_type_t::EPSON;
     p.bits = 32;
     p.code[Power] = 0xC1AA09F6u; p.has[Power] = true;
@@ -2309,6 +2316,7 @@ static void loadBuiltinProfiles() {
   {
     Profile p{};
     p.name = "JVC VCR";
+    p.source = "built-in";
     p.proto = decode_type_t::JVC;
     p.bits = 16;
     p.code[Power] = 0xC2B8u; p.has[Power] = true; 
@@ -2318,6 +2326,7 @@ static void loadBuiltinProfiles() {
   {
     Profile p{};
     p.name = "Denon AVR";
+    p.source = "built-in";
     p.proto = decode_type_t::DENON;
     p.bits = 15;
     p.code[Power] = 0x2278u; p.has[Power] = true;
@@ -2327,6 +2336,7 @@ static void loadBuiltinProfiles() {
   {
     Profile p{};
     p.name = "Denon AVR";
+    p.source = "built-in";
     p.proto = decode_type_t::DENON;
     p.bits = 48;
     p.code[Power] = 0x2A4C028D6CE3ULL; p.has[Power] = true;
@@ -2336,6 +2346,7 @@ static void loadBuiltinProfiles() {
   {
     Profile p{};
     p.name = "Panasonic";
+    p.source = "built-in";
     p.proto = decode_type_t::PANASONIC;
     p.bits = 48;
     p.code[Power] = 0x40040190ED7CULL; p.has[Power] = true;
@@ -2345,6 +2356,7 @@ static void loadBuiltinProfiles() {
   {
     Profile p{};
     p.name = "Pioneer";
+    p.source = "built-in";
     p.proto = decode_type_t::PIONEER;
     p.bits = 64;
     p.code[Power] = 0x55FF00AAAA00FF55ULL; p.has[Power] = true;
@@ -2354,6 +2366,7 @@ static void loadBuiltinProfiles() {
   {
     Profile p{};
     p.name = "DISH";
+    p.source = "built-in";
     p.proto = decode_type_t::DISH;
     p.bits = 16;
     p.code[Power] = 0x9C00u; p.has[Power] = true;
@@ -2363,6 +2376,7 @@ static void loadBuiltinProfiles() {
   {
     Profile p{};
     p.name = "GI Cable";
+    p.source = "built-in";
     p.proto = decode_type_t::GICABLE;
     p.bits = 16;
     p.code[Power] = 0x8807u; p.has[Power] = true;
@@ -2402,6 +2416,7 @@ static bool parseProfilesJson(File& f, size_t docCapacity, String* errOut = null
       Profile p{};
       p.name = String(nm);
       if (!p.name.length()) p.name = String(pr);
+      p.source = "sd";
       p.category = String(cat);
       p.brand = String(br);
       if (!p.category.length()) p.category = inferCategoryFromName(p.name);
@@ -2498,7 +2513,6 @@ static bool parseProfilesJson(File& f, size_t docCapacity, String* errOut = null
 
 static bool loadProfilesFromSd(String* errOut = nullptr) {
   if (!isSDCardAvailable()) { if (errOut) *errOut = "SD not available"; return false; }
-  s_profiles.clear();
 
   if (SD.exists(PROFILES_PATH)) {
     File f = SD.open(PROFILES_PATH, FILE_READ);
@@ -2542,21 +2556,22 @@ static bool loadProfilesFromSd(String* errOut = nullptr) {
 static void refreshProfiles() {
   s_lastErr = "";
   s_loadedFromSd = false;
-
+  
+  loadBuiltinProfiles();
+  
   String err;
   if (loadProfilesFromSd(&err)) {
     s_loadedFromSd = true;
-    s_lastErr = String("SD: ") + (err.length() ? err : String((int)s_profiles.size()));
+    s_lastErr = String("Loaded ") + String((int)s_profiles.size()) + " profiles";
   } else {
-    loadBuiltinProfiles();
-    s_loadedFromSd = false;
     if (err.length()) s_lastErr = "Built-in (SD: " + err + ")";
     else s_lastErr = "Built-in";
   }
-
+  
   if (s_profileIdx < 0) s_profileIdx = 0;
   if (s_profileIdx >= (int)s_profiles.size()) s_profileIdx = 0;
 }
+
 
 static void browseBack();
 static void openCategoryBrowser();
@@ -2625,11 +2640,19 @@ static void drawInfoPanel() {
   tft.setTextColor(UI_DIM_TEXT, FEATURE_BG);
   tft.setCursor(kPadX, kInfoTextY + (kDetailLineStep * 2));
   tft.print("Src:");
-  tft.setTextColor(s_loadedFromSd ? UI_OK : UI_DIM_TEXT, FEATURE_BG);
+  tft.setTextColor(UI_TEXT, FEATURE_BG);
   tft.setCursor(kDetailValueX, kInfoTextY + (kDetailLineStep * 2));
-  tft.print(s_loadedFromSd ? "SD card" : "Built-in");
+  if (p.source == "built-in") {
+      tft.print("Built-in");
+      tft.setTextColor(UI_DIM_TEXT, FEATURE_BG);
+  } else if (p.source == "custom" || p.category == "CUSTOM") {
+      tft.print("Custom");
+      tft.setTextColor(UI_OK, FEATURE_BG);
+  } else {
+      tft.print("SD card");
+      tft.setTextColor(UI_OK, FEATURE_BG);
+  }
 }
-
 static void drawBrowseHeader() {
   tft.fillRect(0, kBodyTop, 240, kListY - kBodyTop, FEATURE_BG);
   tft.setTextFont(1);
@@ -3165,3 +3188,500 @@ void loop() {
   delay(10);
   }
 }
+
+namespace IRCopyController {
+
+static constexpr int kMaxKeys = 12;
+static const char* kKeyNames[kMaxKeys] = {
+    "Power", "Mute", "VolUp", "VolDn", "ChUp", "ChDn",
+    "Up", "Down", "Left", "Right", "Ok", "Back"
+};
+
+static const char* kKeyLabels[kMaxKeys] = {
+    "PWR", "MUTE", "VOL+", "VOL-", "CH+", "CH-",
+    "UP", "DOWN", "LEFT", "RIGHT", "OK", "BACK"
+};
+
+struct CapturedKey {
+    bool has = false;
+    decode_type_t proto = decode_type_t::UNKNOWN;
+    uint16_t bits = 0;
+    uint64_t code = 0;
+    uint16_t rawLen = 0;
+    uint16_t raw[512] = {};
+};
+
+static CapturedKey s_keys[kMaxKeys];
+static int s_currentKey = 0;
+static String s_controllerName = "";
+static bool s_isRecording = false;
+static bool s_isSkipped = false;
+static bool s_uiDrawn = false;
+static uint32_t s_lastActionMs = 0;
+
+static IRrecv s_recv(IR_RX_PIN);
+static IRsend s_send(IR_TX_PIN);
+static decode_results s_results;
+
+static bool s_hasCapture = false;
+static decode_type_t s_decodeType = decode_type_t::UNKNOWN;
+static uint64_t s_value = 0;
+static uint16_t s_bits = 0;
+static uint16_t s_rawLen = 0;
+static uint16_t s_raw[512] = {};
+
+static constexpr int kStatusY = 50;
+static constexpr int kKeyNameY = 80;
+static constexpr int kProgressY = 110;
+static constexpr int kInstructionY1 = 150;
+static constexpr int kInstructionY2 = 165;
+static constexpr int kStatus2Y = 190;
+
+// Debounce tracking
+static uint32_t s_lastButtonPressMs = 0;
+static const uint32_t kButtonDebounceMs = 400;
+
+static void drawUI() {
+    tft.fillScreen(FEATURE_BG);
+    currentBatteryVoltage = readBatteryVoltage();
+    drawStatusBar(currentBatteryVoltage, true);
+
+    tft.setTextFont(2);
+    tft.setTextSize(1);
+
+    tft.setTextColor(UI_ICON, FEATURE_BG);
+    tft.setCursor(10, 30);
+    tft.print("Copy Controller");
+
+    tft.setTextColor(UI_DIM_TEXT, FEATURE_BG);
+    tft.setCursor(10, kProgressY);
+    tft.printf("Progress: %d/%d", s_currentKey, kMaxKeys);
+
+    if (s_currentKey < kMaxKeys) {
+        tft.setTextColor(UI_TEXT, FEATURE_BG);
+        tft.setCursor(10, kKeyNameY);
+        tft.printf("Key %d: %s", s_currentKey + 1, kKeyLabels[s_currentKey]);
+
+        tft.setTextColor(UI_DIM_TEXT, FEATURE_BG);
+        tft.setCursor(10, kInstructionY1);
+        if (s_hasCapture) {
+            tft.print("Press RIGHT to save, UP to re-record");
+        } else {
+            tft.print("Press the key on remote or");
+        }
+        tft.setCursor(10, kInstructionY2);
+        if (s_hasCapture) {
+            // Empty second line when showing save instruction
+        } else {
+            tft.print("LEFT to skip, SELECT to exit");
+        }
+
+        tft.setTextColor(s_hasCapture ? UI_OK : UI_WARN, FEATURE_BG);
+        tft.setCursor(10, kStatus2Y);
+        if (s_hasCapture) {
+            String typeStr = String(typeToString(s_decodeType));
+            tft.printf("Captured: %s | Bits: %d", typeStr.c_str(), s_bits);
+        } else {
+            tft.print("Waiting for signal...");
+        }
+    } else {
+        tft.setTextColor(UI_OK, FEATURE_BG);
+        tft.setCursor(10, kKeyNameY);
+        tft.print("All keys recorded!");
+        tft.setTextColor(UI_DIM_TEXT, FEATURE_BG);
+        tft.setCursor(10, kInstructionY1);
+        tft.print("Press RIGHT to save controller");
+        tft.setCursor(10, kInstructionY2);
+        tft.print("Press SELECT to cancel");
+        tft.setTextColor(UI_DIM_TEXT, FEATURE_BG);
+        tft.setCursor(10, kStatus2Y);
+        tft.print("Skipped keys will be omitted");
+    }
+
+    tft.setTextColor(UI_DIM_TEXT, FEATURE_BG);
+    tft.setCursor(10, 280);
+    tft.print("RIGHT: Save | LEFT: Skip | UP: Redo | SELECT: Exit");
+}
+
+static void pollCapture() {
+    if (s_recv.decode(&s_results)) {
+        const uint16_t rawlen = s_results.rawlen;
+        const uint16_t want = (rawlen > 1) ? (rawlen - 1) : 0;
+
+        if (want > 0 && want <= 512) {
+            for (uint16_t i = 1; i < rawlen; i++) {
+                s_raw[i - 1] = s_results.rawbuf[i] * kRawTick;
+            }
+            s_rawLen = want;
+            s_decodeType = s_results.decode_type;
+            s_value = s_results.value;
+            s_bits = s_results.bits;
+            s_hasCapture = true;
+            s_isSkipped = false;
+            drawUI();
+        }
+        s_recv.resume();
+    }
+}
+
+static void saveCurrentKey() {
+    if (!s_hasCapture) return;
+
+    s_keys[s_currentKey].has = true;
+    s_keys[s_currentKey].proto = s_decodeType;
+    s_keys[s_currentKey].bits = s_bits;
+    s_keys[s_currentKey].code = s_value;
+    s_keys[s_currentKey].rawLen = s_rawLen;
+    memcpy(s_keys[s_currentKey].raw, s_raw, s_rawLen * sizeof(uint16_t));
+
+    s_hasCapture = false;
+    s_currentKey++;
+    s_isSkipped = false;
+    drawUI();
+}
+
+static void skipKey() {
+    // Only skip if we're at a valid key
+    if (s_currentKey >= kMaxKeys) return;
+    
+    // Don't skip if we already have a capture (user should save it first)
+    if (s_hasCapture) {
+        showNotification("IR Copy", "Save or redo current capture first");
+        return;
+    }
+    
+    s_keys[s_currentKey].has = false;
+    s_currentKey++;
+    s_isSkipped = true;
+    drawUI();
+}
+
+static void redoKey() {
+    // Only redo if we have a capture and we're at a valid key
+    if (!s_hasCapture || s_currentKey >= kMaxKeys) return;
+    
+    // Clear the current capture and wait again
+    s_hasCapture = false;
+    drawUI();
+}
+
+static bool ensureDirectory(const char* path) {
+    if (SD.exists(path)) return true;
+    
+    // Try to create the directory
+    if (SD.mkdir(path)) return true;
+    
+    // Try with leading slash removed (some SD libraries work better this way)
+    if (path[0] == '/') {
+        if (SD.mkdir(path + 1)) return true;
+    }
+    
+    return false;
+}
+
+static bool saveControllerToSD() {
+    if (!isSDCardAvailable()) {
+        showNotification("IR Copy", "SD not available");
+        return false;
+    }
+
+    // Ensure directory exists - try multiple approaches
+    if (!ensureDirectory("/ir_profiles")) {
+        showNotification("IR Copy", "Cannot create /ir_profiles");
+        return false;
+    }
+
+    // Count how many keys were actually captured
+    int capturedCount = 0;
+    for (int i = 0; i < kMaxKeys; i++) {
+        if (s_keys[i].has) capturedCount++;
+    }
+
+    // If no keys were captured, don't save
+    if (capturedCount == 0) {
+        showNotification("IR Copy", "No keys captured!");
+        return false;
+    }
+
+    DynamicJsonDocument doc(4096);
+    doc["name"] = s_controllerName;
+    doc["protocol"] = "NEC";  
+    doc["bits"] = 32;
+    doc["category"] = "CUSTOM";
+    doc["brand"] = "CUSTOM";
+
+    JsonObject codes = doc.createNestedObject("codes");
+
+    // Count which protocol is most common
+    int protoCount[16] = {0};
+    for (int i = 0; i < kMaxKeys; i++) {
+        if (s_keys[i].has) {
+            int idx = (int)s_keys[i].proto;
+            if (idx >= 0 && idx < 16) protoCount[idx]++;
+        }
+    }
+
+    // Find most common protocol
+    int bestProto = 0;
+    int bestCount = 0;
+    for (int i = 0; i < 16; i++) {
+        if (protoCount[i] > bestCount) {
+            bestCount = protoCount[i];
+            bestProto = i;
+        }
+    }
+
+    decode_type_t mainProto = (decode_type_t)bestProto;
+    if (bestCount > 0) {
+        doc["protocol"] = String(typeToString(mainProto));
+        for (int i = 0; i < kMaxKeys; i++) {
+            if (s_keys[i].has && s_keys[i].proto == mainProto) {
+                doc["bits"] = s_keys[i].bits;
+                break;
+            }
+        }
+    }
+
+    // Add each key that was captured
+    for (int i = 0; i < kMaxKeys; i++) {
+        if (s_keys[i].has) {
+            String keyName = String(kKeyNames[i]);
+            keyName.toLowerCase();
+            char hexStr[32];
+            snprintf(hexStr, sizeof(hexStr), "0x%016llX", (unsigned long long)s_keys[i].code);
+            codes[keyName] = hexStr;
+        }
+    }
+
+    // Generate filename
+    String filename = "/ir_profiles/";
+    String safeName = s_controllerName;
+    safeName.replace(" ", "_");
+    safeName.replace("/", "_");
+    safeName.replace("\\", "_");
+    String cleanName;
+    for (int i = 0; i < safeName.length(); i++) {
+        char c = safeName[i];
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '_' || c == '-') {
+            cleanName += c;
+        }
+    }
+    if (cleanName.length() == 0) cleanName = "custom_controller";
+    filename += cleanName + ".json";
+
+    // Check if file exists and find a unique name
+    String finalPath = filename;
+    int counter = 1;
+    while (SD.exists(finalPath)) {
+        finalPath = filename.substring(0, filename.length() - 5) + "_" + String(counter) + ".json";
+        counter++;
+    }
+
+    // Write to SD
+    File f = SD.open(finalPath, FILE_WRITE);
+    if (!f) {
+        showNotification("IR Copy", "Cannot create file");
+        return false;
+    }
+
+    if (serializeJson(doc, f) == 0) {
+        f.close();
+        showNotification("IR Copy", "Write failed");
+        return false;
+    }
+    f.close();
+
+    String msg = "Saved: " + s_controllerName + " (" + String(capturedCount) + " keys)";
+    showNotification("IR Copy", msg.c_str());
+    return true;
+}
+
+static void resetState() {
+    s_currentKey = 0;
+    s_hasCapture = false;
+    s_isSkipped = false;
+    s_isRecording = false;
+    s_lastButtonPressMs = 0;
+    for (int i = 0; i < kMaxKeys; i++) {
+        s_keys[i].has = false;
+    }
+    s_recv.enableIRIn();
+}
+
+static void handleUI() {
+    uint32_t now = millis();
+    
+    // Debounce check - prevent any button processing during cooldown
+    if (now - s_lastButtonPressMs < kButtonDebounceMs) {
+        return;
+    }
+
+    // Handle SELECT button = EXIT
+    if (isPhysicalButtonPressed(BTN_SELECT) || isTouchNavButtonPressed(BTN_SELECT)) {
+        s_lastButtonPressMs = now;
+        feature_exit_requested = true;
+        return;
+    }
+
+    // Handle RIGHT button = SAVE
+    if (isPhysicalButtonPressed(BTN_RIGHT) || isTouchNavButtonPressed(BTN_RIGHT)) {
+        s_lastButtonPressMs = now;
+
+        if (s_currentKey >= kMaxKeys) {
+            // All keys done - save the whole controller
+            if (saveControllerToSD()) {
+                feature_exit_requested = true;
+            }
+            return;
+        }
+
+        // Not all keys done - save current capture if we have one
+        if (s_hasCapture) {
+            saveCurrentKey();
+        }
+        return;
+    }
+
+    // Handle LEFT button = SKIP
+    if (isPhysicalButtonPressed(BTN_LEFT) || isTouchNavButtonPressed(BTN_LEFT)) {
+        s_lastButtonPressMs = now;
+        skipKey();
+        return;
+    }
+
+    // Handle UP button = REDO
+    if (isPhysicalButtonPressed(BTN_UP) || isTouchNavButtonPressed(BTN_UP)) {
+        if (s_hasCapture && s_currentKey < kMaxKeys) {
+            s_lastButtonPressMs = now;
+            redoKey();
+        }
+        return;
+    }
+}
+
+static void handleTouch() {
+    int x, y;
+    if (!readTouchXY(x, y)) return;
+
+    uint32_t now = millis();
+    
+    // Debounce check for touch
+    if (now - s_lastButtonPressMs < kButtonDebounceMs) {
+        return;
+    }
+
+    // Check for button clicks on the UI
+    // Main selection area (center of screen) - acts like SAVE (RIGHT)
+    if (x > 20 && x < 220 && y > 60 && y < 200) {
+        s_lastButtonPressMs = now;
+        
+        if (s_currentKey >= kMaxKeys) {
+            // All keys done - save
+            if (saveControllerToSD()) {
+                feature_exit_requested = true;
+            }
+            return;
+        }
+
+        if (s_hasCapture) {
+            saveCurrentKey();
+        }
+        return;
+    }
+
+    // Left side - skip
+    if (x < 80 && y > 200 && y < 240) {
+        if (s_currentKey < kMaxKeys) {
+            s_lastButtonPressMs = now;
+            skipKey();
+        }
+        return;
+    }
+
+    // Right side - redo
+    if (x > 160 && y > 200 && y < 240) {
+        if (s_hasCapture && s_currentKey < kMaxKeys) {
+            s_lastButtonPressMs = now;
+            redoKey();
+        }
+        return;
+    }
+}
+
+void setup() {
+    setTouchButtonInputEnabled(false);
+
+    // Get controller name
+    OnScreenKeyboardConfig cfg;
+    cfg.titleLine1 = "Enter controller name";
+    cfg.titleLine2 = "(max 20 chars)";
+    osKeyboardUseStandardLayout(cfg);
+    cfg.maxLen = 20;
+    cfg.buttonsY = 195;
+    cfg.backLabel = "Cancel";
+    cfg.middleLabel = "Clear";
+    cfg.okLabel = "OK";
+    cfg.requireNonEmpty = true;
+    cfg.emptyErrorMsg = "Name cannot be empty!";
+
+    const char* shuffleNames[] = {"TV", "AC", "Lamp", "Receiver", "Projector", "Soundbar"};
+    cfg.shuffleNames = shuffleNames;
+    cfg.shuffleCount = 6;
+    cfg.enableShuffle = true;
+
+    OnScreenKeyboardResult r = showOnScreenKeyboard(cfg, "");
+    if (!r.accepted) {
+        feature_exit_requested = true;
+        return;
+    }
+
+    s_controllerName = r.text;
+
+    // Initialize hardware
+    pinMode(IR_RX_PIN, INPUT_PULLUP);
+    pinMode(IR_TX_PIN, OUTPUT);
+    s_send.begin();
+    s_recv.enableIRIn();
+
+    resetState();
+    s_uiDrawn = false;
+
+    // Show initial UI
+    drawUI();
+
+    // Set nav labels for the feature
+    setTouchButtonInputEnabled(true);
+    setTouchNavLabels("Skip", "Save", "Exit", "Redo", "");
+}
+
+void loop() {
+    if (feature_active && (feature_exit_requested || featureExitButtonPressed())) {
+        feature_exit_requested = true;
+        return;
+    }
+
+    // Poll for IR capture
+    if (s_currentKey < kMaxKeys && !s_hasCapture) {
+        pollCapture();
+    }
+
+    // Handle physical buttons
+    handleUI();
+
+    // Handle touch
+    if (!feature_exit_requested) {
+        handleTouch();
+    }
+
+    // Redraw if needed
+    if (!s_uiDrawn) {
+        drawUI();
+        s_uiDrawn = true;
+    }
+
+    maintainTouchNavBar();
+    delay(10);
+}
+
+} // namespace IRCopyController
