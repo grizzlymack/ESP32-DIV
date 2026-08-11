@@ -172,9 +172,8 @@ const char *ir_submenu_items[ir_NUM_SUBMENU_ITEMS] = {
     "Record",
     "Saved Profile",
     "Universal Controller",
-    "Copy Controller", 
+    "Copy Controller",
     "Back to Main Menu"};
-
 
 const int about_NUM_SUBMENU_ITEMS = 1;
 const char *about_submenu_items[about_NUM_SUBMENU_ITEMS] = {
@@ -298,7 +297,7 @@ const unsigned char *ir_submenu_icons[ir_NUM_SUBMENU_ITEMS] = {
     bitmap_icon_led,
     bitmap_icon_list,
     bitmap_icon_remote_control,
-    bitmap_icon_follow, 
+    bitmap_icon_follow,
     bitmap_icon_go_back
 };
 
@@ -826,7 +825,8 @@ static void runBleDuckyFeature() {
 }
 
 // Hardware buses are initialized in setup() before the first real reading.
-float currentBatteryVoltage = 3.0f;
+// 3.9V maps to ~75% in the status bar — avoids showing 0% during boot.
+float currentBatteryVoltage = 3.9f;
 unsigned long last_interaction_time = 0;
 
 int last_menu_index = -1;
@@ -3982,7 +3982,7 @@ void handleOtherSubmenuButtons() {
                     displaySubmenu();
                     delay(200);
                 }
-            } else if (current_submenu_index == 3) { 
+            } else if (current_submenu_index == 3) {
                 current_submenu_index = 3;
                 in_sub_menu = true;
                 feature_active = true;

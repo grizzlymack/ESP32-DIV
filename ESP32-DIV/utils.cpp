@@ -475,80 +475,68 @@ const float R1 = 100000.0;
 const float R2 = 100000.0;
 
 #if defined(BOARD_ESP32_DIV_V2)
-static constexpr uint8_t IP5306_ADDRESS = 0x75;
-static constexpr uint8_t IP5306_BATTERY_LEVEL_REGISTER = 0x78;
+/* DIV v2: IP5306 PMIC reports 4 coarse levels on I2C (no usable battery ADC). */
+static constexpr uint8_t kIp5306Addr = 0x75;
+static constexpr uint8_t kIp5306BattReg = 0x78;
 
-static int readIP5306Register(uint8_t reg) {
-  Wire.beginTransmission(IP5306_ADDRESS);
+static int readIp5306Register(uint8_t reg) {
+  Wire.beginTransmission(kIp5306Addr);
   Wire.write(reg);
-
   if (Wire.endTransmission(false) != 0) {
     return -1;
   }
-
-  if (Wire.requestFrom(IP5306_ADDRESS, static_cast<uint8_t>(1)) != 1) {
+  if (Wire.requestFrom(kIp5306Addr, static_cast<uint8_t>(1)) != 1) {
     return -1;
   }
-
   return Wire.read();
 }
-#endif
 
-float readBatteryVoltage()
-{
-#if defined(BOARD_ESP32_DIV_V2)
-  static float lastValidVoltage = 3.0f;
+static float readBatteryVoltageIp5306() {
+  static float lastValidVoltage = 3.9f;
 
-  const int value = readIP5306Register(IP5306_BATTERY_LEVEL_REGISTER);
+  const int value = readIp5306Register(kIp5306BattReg);
   if (value < 0) {
     return lastValidVoltage;
   }
 
-  int batteryPercentage = -1;
+  int pct;
   switch (value & 0xF0) {
-    case 0xE0:
-      batteryPercentage = 25;
-      break;
-    case 0xC0:
-      batteryPercentage = 50;
-      break;
-    case 0x80:
-      batteryPercentage = 75;
-      break;
-    case 0x00:
-      batteryPercentage = 100;
-      break;
+    case 0xE0: pct = 25; break;
+    case 0xC0: pct = 50; break;
+    case 0x80: pct = 75; break;
+    case 0x00: pct = 100; break;
     default:
       return lastValidVoltage;
   }
 
-  lastValidVoltage =
-      3.0f + (static_cast<float>(batteryPercentage) * 1.2f / 100.0f);
+  // Synthetic volts so status-bar map(v*100, 300, 420, 0, 100) hits exact steps.
+  lastValidVoltage = 3.0f + (static_cast<float>(pct) * 1.2f / 100.0f);
   return lastValidVoltage;
+}
+#endif
+
+float readBatteryVoltage() {
+#if defined(BOARD_ESP32_DIV_V2)
+  return readBatteryVoltageIp5306();
 #elif BATTERY_ADC_PIN >= 0
   static bool adcInitialized = false;
-
-  if (!adcInitialized)
-  {
+  if (!adcInitialized) {
     analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
     adcInitialized = true;
   }
 
   const int sampleCount = 16;
   uint32_t sum = 0;
-
-  for (int i = 0; i < sampleCount; i++)
-  {
+  for (int i = 0; i < sampleCount; i++) {
     sum += analogReadMilliVolts(BATTERY_ADC_PIN);
     delayMicroseconds(500);
   }
 
-  float avgMv = sum / (float)sampleCount;
-
+  const float avgMv = sum / (float)sampleCount;
   return (avgMv / 1000.0f) * 2.0f;
 #else
-  // Boards without a battery measurement retain the status bar's 0% fallback.
-  return 3.0f;
+  // Boards without battery measurement (e.g. CYD) — show ~75% as "powered".
+  return 3.9f;
 #endif
 }
 
@@ -602,10 +590,10 @@ void drawStatusBar(float batteryVoltage, bool forceUpdate, bool bottomSeparator)
   static int lastTempBand          = -100;
   static int lastSdSnap            = -1;
   static bool lastWardGpsIcon      = false;
+  static bool lastShowBatteryPercent = true;
   static uint32_t lastWardBlinkPhase = 0;
 
-  int batteryPercentage =
-      ::map(lroundf(batteryVoltage * 100.0f), 300L, 420L, 0L, 100L);
+  int batteryPercentage = ::map(lroundf(batteryVoltage * 100.0f), 300L, 420L, 0L, 100L);
   batteryPercentage = constrain(batteryPercentage, 0, 100);
 
   int wifiDevices = 0;
@@ -626,6 +614,7 @@ void drawStatusBar(float batteryVoltage, bool forceUpdate, bool bottomSeparator)
   const float internalTemp = readInternalTemperature();
   const int tempBand         = statusBarTempBand(internalTemp);
   const int sdSnap           = sdCardPresent ? 1 : 0;
+  const bool showBatteryPct  = settings().showBatteryPercent;
 
   const bool battCh =
       statusBarBatteryMeaningfulChange(batteryPercentage, lastBatteryPercentage, forceUpdate);
@@ -657,6 +646,7 @@ void drawStatusBar(float batteryVoltage, bool forceUpdate, bool bottomSeparator)
 
   if (battCh || wifiHalf != lastWifiHalf || bleHalf != lastBleHalf || tempBand != lastTempBand ||
       sdSnap != lastSdSnap || wardGpsIcon != lastWardGpsIcon ||
+      showBatteryPct != lastShowBatteryPercent ||
       (wardGpsIcon && wardBlinkPhase != lastWardBlinkPhase) || forceUpdate) {
     int barHeight = 20;
     int x = 7;
@@ -671,11 +661,13 @@ void drawStatusBar(float batteryVoltage, bool forceUpdate, bool bottomSeparator)
     uint16_t batteryColor = (batteryPercentage > 20) ? GREEN : TFT_RED;
     tft.fillRoundRect(x + 2, y + 2, batteryLevelWidth, 6, 1, batteryColor);
 
-    tft.setCursor(x + 30, y + 2);
-    tft.setTextColor(GREEN, UI_LABLE);
-    tft.setTextFont(1);
-    tft.setTextSize(1);
-    tft.print(String(batteryPercentage) + "%");
+    if (showBatteryPct) {
+      tft.setCursor(x + 30, y + 2);
+      tft.setTextColor(GREEN, UI_LABLE);
+      tft.setTextFont(1);
+      tft.setTextSize(1);
+      tft.print(String(batteryPercentage) + "%");
+    }
 
     const int iconW         = 16;
     const int gap           = 3;
@@ -749,6 +741,7 @@ void drawStatusBar(float batteryVoltage, bool forceUpdate, bool bottomSeparator)
     lastSdSnap            = sdSnap;
     lastWardGpsIcon       = wardGpsIcon;
     lastWardBlinkPhase    = wardGpsIcon ? wardBlinkPhase : 0u;
+    lastShowBatteryPercent = showBatteryPct;
   }
 }
 
@@ -1659,7 +1652,7 @@ static int  sel = 0;
 static bool dirtySettings = false;
 static bool uiDirty = false;
 
-static const char* items[] = {"Brightness", "Theme", "Accent", "NeoPixel", "Auto Scan"};
+static const char* items[] = {"Brightness", "Theme", "Accent", "NeoPixel", "Auto Scan", "Battery %"};
 static const int N = sizeof(items)/sizeof(items[0]);
 
 static uint8_t  last_brightness;
@@ -1667,6 +1660,7 @@ static Theme    last_theme;
 static uint8_t  last_accent;
 static bool     last_neopixel;
 static bool     last_autoScan;
+static bool     last_showBatteryPercent;
 static int      last_sel;
 
 static bool dragging = false;
@@ -1904,6 +1898,7 @@ static void drawSwitchRow(bool on, bool selected, int row) {
 
 static void drawNeoPixel(bool on, bool selected) { drawSwitchRow(on, selected, 3); }
 static void drawAutoScan(bool on, bool selected) { drawSwitchRow(on, selected, 4); }
+static void drawBatteryPercent(bool on, bool selected) { drawSwitchRow(on, selected, 5); }
 
 static Rect backRect(){
   int h = tft.height();
@@ -1970,6 +1965,7 @@ static void drawAll() {
   drawNeoPixel(s.neopixelEnabled, sel==3);
   bool autoScan = (s.autoWifiScan || s.autoBleScan);
   drawAutoScan(autoScan, sel==4);
+  drawBatteryPercent(s.showBatteryPercent, sel==5);
 
   drawFooter(false, false);
 
@@ -1979,6 +1975,7 @@ static void drawAll() {
   last_accent     = s.accentColor;
   last_neopixel   = s.neopixelEnabled;
   last_autoScan     = autoScan;
+  last_showBatteryPercent = s.showBatteryPercent;
   uiDirty = false;
 }
 
@@ -1999,6 +1996,7 @@ static void redrawIfChanged() {
     drawCardStatic(3, sel==3);  drawSwitchWidgetRow(s.neopixelEnabled, sel==3, 3);
     bool autoScan = (s.autoWifiScan || s.autoBleScan);
     drawCardStatic(4, sel==4);  drawSwitchWidgetRow(autoScan, sel==4, 4);
+    drawCardStatic(5, sel==5);  drawSwitchWidgetRow(s.showBatteryPercent, sel==5, 5);
     last_sel = sel;
   } else {
     if (s.brightness != last_brightness) {
@@ -2013,6 +2011,10 @@ static void redrawIfChanged() {
     if (autoScan != last_autoScan) {
       drawSwitchWidgetRow(autoScan, sel==4, 4);
       last_autoScan = autoScan;
+    }
+    if (s.showBatteryPercent != last_showBatteryPercent) {
+      drawSwitchWidgetRow(s.showBatteryPercent, sel==5, 5);
+      last_showBatteryPercent = s.showBatteryPercent;
     }
     if (s.theme != last_theme) {
       drawThemeWidget(s.theme, sel==1);
@@ -2078,15 +2080,40 @@ static bool applyAutoScan(bool en){
   return true;
 }
 
+static bool applyShowBatteryPercent(bool en){
+  auto& s = settings();
+  if (s.showBatteryPercent == en) return false;
+  s.showBatteryPercent = en;
+  dirtySettings = true;
+  uiDirty = true;
+  requestStatusBarRedraw();
+  drawStatusBar(currentBatteryVoltage, true);
+  lastChangeMs = millis();
+  return true;
+}
+
 static void handleTouch() {
   int tx, ty;
-  static uint32_t lastToggleMs = 0;
-  static bool accentArmed = true;
+  static uint32_t lastActionMs = 0;
+  static uint32_t touchUpSinceMs = 0;
+  static bool switchArmed = true;
+  constexpr uint32_t kReleaseArmMs = 160;
+  constexpr uint32_t kCooldownMs   = 220;
+
+  const uint32_t now = millis();
+
   if (!readTouchXY(tx, ty)) {
     dragging = false;
-    accentArmed = true;
+    if (touchUpSinceMs == 0) {
+      touchUpSinceMs = now;
+    }
+    if ((now - touchUpSinceMs) >= kReleaseArmMs) {
+      switchArmed = true;
+    }
     return;
   }
+
+  touchUpSinceMs = 0;
 
   Rect br = backRect();
   Rect sr = saveRect();
@@ -2126,6 +2153,7 @@ static void handleTouch() {
   }
 
   auto& s = settings();
+  const bool canFire = switchArmed && ((now - lastActionMs) >= kCooldownMs);
 
   if (sel == 0) {
     Rect tr = rBrightTrack();
@@ -2145,50 +2173,54 @@ static void handleTouch() {
   } else if (sel == 1) {
     Rect d = rThemeDark();
     Rect l = rThemeLight();
-    uint32_t now = millis();
     if (tx >= d.x && tx <= d.x+d.w && ty >= d.y && ty <= d.y+d.h) {
-      if (now - lastToggleMs > 200) {
+      if (canFire) {
         applyTheme(Theme::Dark);
-        lastToggleMs = now;
+        lastActionMs = now;
+        switchArmed = false;
       }
     } else if (tx >= l.x && tx <= l.x+l.w && ty >= l.y && ty <= l.y+l.h) {
-      if (now - lastToggleMs > 200) {
+      if (canFire) {
         applyTheme(Theme::Light);
-        lastToggleMs = now;
+        lastActionMs = now;
+        switchArmed = false;
       }
     }
   } else if (sel == 2) {
     Rect sw = rAccentSwatch();
     const bool onSwatch =
         (tx >= sw.x - 80 && tx <= sw.x + sw.w && ty >= sw.y - 8 && ty <= sw.y + sw.h + 8);
-    if (onSwatch) {
-      uint32_t now = millis();
-      if (accentArmed && (now - lastToggleMs > 250)) {
-        uint8_t next = (s.accentColor + 1) % ACCENT_PRESET_COUNT;
-        applyAccent(next);
-        lastToggleMs = now;
-        accentArmed = false;
-      }
-    } else {
-      accentArmed = true;
+    if (onSwatch && canFire) {
+      applyAccent((s.accentColor + 1) % ACCENT_PRESET_COUNT);
+      lastActionMs = now;
+      switchArmed = false;
     }
   } else if (sel == 3) {
     Rect tr = rSwitchTrack(3);
     if (tx >= tr.x && tx <= tr.x+tr.w && ty >= tr.y-10 && ty <= tr.y+tr.h+10) {
-      uint32_t now = millis();
-      if (now - lastToggleMs > 120) {
+      if (canFire) {
         applyNeoPixel(!s.neopixelEnabled);
-        lastToggleMs = now;
+        lastActionMs = now;
+        switchArmed = false;
       }
     }
   } else if (sel == 4) {
     Rect tr = rSwitchTrack(4);
     if (tx >= tr.x && tx <= tr.x+tr.w && ty >= tr.y-10 && ty <= tr.y+tr.h+10) {
-      uint32_t now = millis();
-      if (now - lastToggleMs > 120) {
+      if (canFire) {
         bool autoScan = (s.autoWifiScan || s.autoBleScan);
         applyAutoScan(!autoScan);
-        lastToggleMs = now;
+        lastActionMs = now;
+        switchArmed = false;
+      }
+    }
+  } else if (sel == 5) {
+    Rect tr = rSwitchTrack(5);
+    if (tx >= tr.x && tx <= tr.x+tr.w && ty >= tr.y-10 && ty <= tr.y+tr.h+10) {
+      if (canFire) {
+        applyShowBatteryPercent(!s.showBatteryPercent);
+        lastActionMs = now;
+        switchArmed = false;
       }
     }
   }
@@ -2246,6 +2278,7 @@ void loop(){
     else if (sel==2)                   { applyAccent((s.accentColor + ACCENT_PRESET_COUNT - 1) % ACCENT_PRESET_COUNT); }
     else if (sel==3)                   { applyNeoPixel(false); }
     else if (sel==4)                   { applyAutoScan(false); }
+    else if (sel==5)                   { applyShowBatteryPercent(false); }
     changedByButtons=true;
     lastActionMs = now;
   }
@@ -2256,6 +2289,7 @@ void loop(){
     else if (sel==2)                   { applyAccent((s.accentColor + 1) % ACCENT_PRESET_COUNT); }
     else if (sel==3)                   { applyNeoPixel(true); }
     else if (sel==4)                   { applyAutoScan(true); }
+    else if (sel==5)                   { applyShowBatteryPercent(true); }
     changedByButtons=true;
     lastActionMs = now;
   }

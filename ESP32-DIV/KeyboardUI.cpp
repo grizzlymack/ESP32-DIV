@@ -158,15 +158,18 @@ void drawInputField(const String& value, bool cursorOn) {
 }
 
 void drawTitles(const OnScreenKeyboardConfig& cfg) {
+  // Titles sit under the status bar (not at the bottom — that left the IR menu
+  // chrome visible above the old clear region starting at y=37).
   tft.setTextColor(KB_BORDER(), KB_BG());
   tft.setTextSize(1);
+  tft.setTextFont(1);
   if (cfg.titleLine1 && cfg.titleLine1[0]) {
-    tft.setCursor(1, 230);
-    tft.println(cfg.titleLine1);
+    tft.setCursor(10, 24);
+    tft.print(cfg.titleLine1);
   }
   if (cfg.titleLine2 && cfg.titleLine2[0]) {
-    tft.setCursor(20, 245);
-    tft.println(cfg.titleLine2);
+    tft.setCursor(10, 36);
+    tft.print(cfg.titleLine2);
   }
 }
 
@@ -278,7 +281,10 @@ OnScreenKeyboardResult showOnScreenKeyboard(const OnScreenKeyboardConfig& cfg,
   const uint8_t activeRowCount =
       useStandard ? OS_KEYBOARD_ROW_COUNT : cfg.rowCount;
 
-  tft.fillRect(0, 37, tft.width(), tft.height() - 37, KB_BG());
+  // Full clear — previous feature menus leave chrome in y=0..36 if we only
+  // wipe from y=37 (Copy Controller / IR submenu icons were leaking through).
+  tft.fillScreen(KB_BG());
+  drawStatusBar(readBatteryVoltage(), true);
 
   bool cursorOn = true;
   unsigned long lastBlink = millis();

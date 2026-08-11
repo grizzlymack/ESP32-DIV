@@ -105,6 +105,7 @@ bool settingsLoad() {
 
   s.autoWifiScan    = doc["autoWifiScan"]    | s.autoWifiScan;
   s.autoBleScan     = doc["autoBleScan"]     | s.autoBleScan;
+  s.showBatteryPercent = doc["showBatteryPercent"] | s.showBatteryPercent;
 
   if (s.autoWifiScan != s.autoBleScan) {
     bool en = (s.autoWifiScan || s.autoBleScan);
@@ -151,6 +152,7 @@ bool settingsSave() {
 
   doc["autoWifiScan"]    = s.autoWifiScan;
   doc["autoBleScan"]     = s.autoBleScan;
+  doc["showBatteryPercent"] = s.showBatteryPercent;
 
   JsonObject t = doc.createNestedObject("touch");
   t["xMin"] = s.touchXMin;

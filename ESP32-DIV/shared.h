@@ -727,6 +727,8 @@ static const uint8_t OBF_WB[]   = {75, 97, 110, 109, 122, 92, 109, 107, 96, 38, 
 #ifndef BATTERY_LOW_VOLT
 #define BATTERY_LOW_VOLT 3.40f
 #endif
+/* DIV v2 battery is read from IP5306 over I2C (see readBatteryVoltage in utils.cpp).
+ * V1 still uses BATTERY_ADC_PIN voltage divider. */
 
 /*──────────────────── Wi-Fi ────────────────────*/
 #ifndef WIFI_SCAN_ACTIVE_MS
