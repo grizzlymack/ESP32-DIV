@@ -825,7 +825,8 @@ static void runBleDuckyFeature() {
 #endif
 }
 
-float currentBatteryVoltage = readBatteryVoltage();
+// Hardware buses are initialized in setup() before the first real reading.
+float currentBatteryVoltage = 3.0f;
 unsigned long last_interaction_time = 0;
 
 int last_menu_index = -1;
