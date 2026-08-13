@@ -4277,3 +4277,1954 @@ void Loop() {
 }
 
 }  // namespace jammingdetector
+
+// ══════════════════════════════════════════════════════════════════
+// Multi-Remote Manager
+// Save and organize captured remotes by category. Quick-fire from a
+// browsable category list instead of scrolling through generic profiles.
+// Stores on SD card at /subghz/remotes/ with category subfolders.
+// ══════════════════════════════════════════════════════════════════
+namespace RemoteManager {
+
+#undef TFT_BLACK
+#define TFT_BLACK FEATURE_BG
+
+static constexpr const char* kRemotesDir = "/subghz/remotes";
+static constexpr int kMaxRemotes = 50;
+static constexpr int kMaxNameLen = 16;
+
+static const char* kCategories[] = {
+  "Garage", "Gate", "Doorbell", "Fan", "Light", "Outlet", "Car", "Other"
+};
+static constexpr int kNumCategories = 8;
+
+struct RemoteEntry {
+  char name[kMaxNameLen];
+  uint32_t frequency;
+  uint32_t value;
+  uint16_t bitLength;
+  uint16_t protocol;
+  uint8_t category;
+  bool valid;
+};
+
+static RemoteEntry s_remotes[kMaxRemotes];
+static int s_remoteCount = 0;
+static int s_selIdx = 0;
+static int s_listPage = 0;
+static uint8_t s_filterCategory = 0;
+static bool s_showAll = true;
+
+RCSwitch mySwitch = RCSwitch();
+
+static constexpr int kHeaderY = 22;
+static constexpr int kRowH = 20;
+static constexpr int kFirstRowY = kHeaderY + 16;
+
+static int rmContentBottom() {
+  return featureHasTouchNavBar() ? touchNavContentBottomY() : 320;
+}
+
+static int rmRowsPerPage() {
+  return max(1, (rmContentBottom() - kFirstRowY) / kRowH);
+}
+
+static void rmInitCC1101(uint32_t freq, bool tx) {
+  reclaimSharedSpiBus();
+  ELECHOUSE_cc1101.setSpiPin(CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CS);
+  ELECHOUSE_cc1101.setGDO(CC1101_GDO0, CC1101_GDO2);
+  ELECHOUSE_cc1101.Init();
+  ELECHOUSE_cc1101.setModulation(2);
+  ELECHOUSE_cc1101.setRxBW(500.0);
+  ELECHOUSE_cc1101.setMHZ(freq / 1000000.0);
+  if (tx) ELECHOUSE_cc1101.SetTx();
+  else ELECHOUSE_cc1101.SetRx();
+}
+
+static String rmCategoryDir(uint8_t cat) {
+  if (cat < kNumCategories) {
+    return String(kRemotesDir) + "/" + kCategories[cat];
+  }
+  return String(kRemotesDir) + "/Other";
+}
+
+static bool rmMountSD() {
+  restoreSdAfterSharedSpi();
+  return isSDCardAvailable();
+}
+
+static void rmLoadRemotes() {
+  s_remoteCount = 0;
+  memset(s_remotes, 0, sizeof(s_remotes));
+
+  if (!rmMountSD()) return;
+
+  if (!SD.exists(kRemotesDir)) SD.mkdir(kRemotesDir);
+
+  for (uint8_t c = 0; c < kNumCategories && s_remoteCount < kMaxRemotes; c++) {
+    String dir = rmCategoryDir(c);
+    if (!SD.exists(dir.c_str())) continue;
+
+    File dirFile = SD.open(dir.c_str());
+    if (!dirFile || !dirFile.isDirectory()) continue;
+
+    File entry;
+    while ((entry = dirFile.openNextFile()) && s_remoteCount < kMaxRemotes) {
+      if (entry.isDirectory()) { entry.close(); continue; }
+      String name = entry.name();
+      entry.close();
+
+      String path = dir + "/" + name;
+      File f = SD.open(path.c_str(), FILE_READ);
+      if (!f) continue;
+
+      RemoteEntry r = {};
+      r.category = c;
+      r.valid = true;
+
+      if (f.available() >= 12) {
+        f.readBytes((char*)&r.frequency, 4);
+        f.readBytes((char*)&r.value, 4);
+        f.readBytes((char*)&r.bitLength, 2);
+        f.readBytes((char*)&r.protocol, 2);
+      }
+      String fname = name;
+      fname.toUpperCase();
+      if (fname.endsWith(".BIN")) fname = fname.substring(0, fname.length() - 4);
+      strncpy(r.name, fname.c_str(), kMaxNameLen - 1);
+      r.name[kMaxNameLen - 1] = '\0';
+
+      f.close();
+      s_remotes[s_remoteCount++] = r;
+    }
+    dirFile.close();
+  }
+}
+
+static int rmFilteredCount() {
+  if (s_showAll) return s_remoteCount;
+  int count = 0;
+  for (int i = 0; i < s_remoteCount; i++) {
+    if (s_remotes[i].category == (s_filterCategory - 1)) count++;
+  }
+  return count;
+}
+
+static int rmFilteredIndex(int visibleIdx) {
+  if (s_showAll) return visibleIdx;
+  int count = 0;
+  for (int i = 0; i < s_remoteCount; i++) {
+    if (s_remotes[i].category == (s_filterCategory - 1)) {
+      if (count == visibleIdx) return i;
+      count++;
+    }
+  }
+  return -1;
+}
+
+static void rmDrawList() {
+  featureClearContent(TFT_BLACK);
+  tft.drawFastHLine(0, 19, 240, UI_LINE);
+
+  tft.setTextFont(1);
+  tft.setTextSize(1);
+
+  tft.setTextColor(FEATURE_TEXT, TFT_BLACK);
+  tft.setCursor(5, kHeaderY);
+  if (s_showAll) {
+    tft.print("All Remotes");
+  } else {
+    tft.print(kCategories[s_filterCategory - 1]);
+  }
+  tft.setTextColor(UI_TEXT, TFT_BLACK);
+  tft.setCursor(160, kHeaderY);
+  tft.print(rmFilteredCount());
+  tft.print(" saved");
+
+  int y = kFirstRowY;
+  const int perPage = rmRowsPerPage();
+  const int filteredCount = rmFilteredCount();
+
+  if (filteredCount == 0) {
+    tft.setTextColor(UI_TEXT, TFT_BLACK);
+    tft.setCursor(20, 80);
+    tft.print("No remotes saved yet.");
+    tft.setCursor(20, 100);
+    tft.print("Use RF Cloner to capture.");
+  } else {
+    for (int vis = 0; vis < perPage && vis < filteredCount; vis++) {
+      int actualIdx = rmFilteredIndex(vis);
+      if (actualIdx < 0) break;
+      const RemoteEntry& r = s_remotes[actualIdx];
+
+      bool isSel = (vis == s_selIdx);
+      uint16_t bg = isSel ? 0x4208 : TFT_BLACK;
+      uint16_t fg = isSel ? ORANGE : TFT_WHITE;
+
+      tft.fillRect(0, y, 240, kRowH - 2, bg);
+      tft.setTextColor(fg, bg);
+      tft.setCursor(3, y + 1);
+      tft.print(isSel ? ">" : " ");
+      tft.setCursor(10, y + 1);
+
+      char nameBuf[kMaxNameLen + 1];
+      strncpy(nameBuf, r.name, kMaxNameLen);
+      nameBuf[kMaxNameLen] = '\0';
+      if (strlen(nameBuf) > 12) {
+        nameBuf[12] = '\0';
+        strcat(nameBuf, "..");
+      }
+      tft.print(nameBuf);
+
+      tft.setTextColor(TFT_CYAN, bg);
+      tft.setCursor(130, y + 1);
+      if (r.category < kNumCategories) {
+        tft.print(kCategories[r.category]);
+      }
+
+      tft.setTextColor(UI_TEXT, bg);
+      tft.setCursor(190, y + 1);
+      tft.print(r.frequency / 1000000.0, 2);
+      tft.print("M");
+
+      y += kRowH;
+    }
+  }
+
+  tft.setTextColor(UI_TEXT, TFT_BLACK);
+  tft.setCursor(5, rmContentBottom() - 12);
+  tft.print("UP/DOWN: sel  LEFT: filter  RIGHT: fire");
+
+  if (featureHasTouchNavBar()) {
+    setTouchNavLabels("Filter", "Next", "Exit", "Prev", "Fire");
+  }
+}
+
+static void rmDrawDetail(int actualIdx) {
+  if (actualIdx < 0 || actualIdx >= s_remoteCount) return;
+  const RemoteEntry& r = s_remotes[actualIdx];
+
+  featureClearContent(TFT_BLACK);
+  tft.drawFastHLine(0, 19, 240, UI_LINE);
+
+  tft.setTextFont(1);
+  tft.setTextSize(1);
+
+  tft.setTextColor(FEATURE_TEXT, TFT_BLACK);
+  tft.setCursor(5, kHeaderY);
+  tft.print("Remote Details");
+
+  int y = kHeaderY + 16;
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setCursor(5, y);
+  tft.print("Name: ");
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.print(r.name);
+  y += 14;
+
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setCursor(5, y);
+  tft.print("Category: ");
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  if (r.category < kNumCategories) tft.print(kCategories[r.category]);
+  y += 14;
+
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setCursor(5, y);
+  tft.print("Freq: ");
+  tft.print(r.frequency / 1000000.0, 3);
+  tft.print(" MHz");
+  y += 14;
+
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setCursor(5, y);
+  tft.print("Value: 0x");
+  char hexBuf[16];
+  snprintf(hexBuf, sizeof(hexBuf), "%lX", (unsigned long)r.value);
+  tft.print(hexBuf);
+  y += 14;
+
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setCursor(5, y);
+  tft.print("Bits: ");
+  tft.print(r.bitLength);
+  tft.print("  Proto: ");
+  tft.print(r.protocol);
+  y += 20;
+
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.setCursor(5, y);
+  tft.print("RIGHT: Transmit  LEFT: Back");
+
+  if (featureHasTouchNavBar()) {
+    setTouchNavLabels("Back", "", "Exit", "", "Fire");
+  }
+}
+
+static void rmTransmit(int actualIdx) {
+  if (actualIdx < 0 || actualIdx >= s_remoteCount) return;
+  const RemoteEntry& r = s_remotes[actualIdx];
+
+  rmInitCC1101(r.frequency, true);
+  mySwitch.enableTransmit(SUBGHZ_TX_PIN);
+  mySwitch.setProtocol(r.protocol);
+  mySwitch.send(r.value, r.bitLength);
+  delay(50);
+  mySwitch.send(r.value, r.bitLength);
+  mySwitch.disableTransmit();
+
+  ELECHOUSE_cc1101.SetRx();
+  restoreSdAfterSharedSpi();
+}
+
+static bool s_inDetailView = false;
+static int s_detailActualIdx = -1;
+
+void remoteMgrSetup() {
+  pauseBackgroundRadioTasks();
+  setTouchButtonInputEnabled(true);
+  featureClearContent(TFT_BLACK);
+
+  float battV = readBatteryVoltage();
+  drawStatusBar(battV, true);
+  redrawTouchButtonBar();
+
+#if HAS_PCF8574_BUTTONS
+  pcf.pinMode(BTN_UP, INPUT_PULLUP);
+  pcf.pinMode(BTN_DOWN, INPUT_PULLUP);
+  pcf.pinMode(BTN_RIGHT, INPUT_PULLUP);
+  pcf.pinMode(BTN_LEFT, INPUT_PULLUP);
+#endif
+
+  setupTouchscreen();
+
+  s_selIdx = 0;
+  s_listPage = 0;
+  s_showAll = true;
+  s_filterCategory = 0;
+  s_inDetailView = false;
+  s_detailActualIdx = -1;
+
+  rmLoadRemotes();
+  rmDrawList();
+  redrawTouchButtonBar();
+}
+
+void remoteMgrLoop() {
+  if (feature_active && (isButtonPressed(BTN_SELECT) || featureExitButtonPressed())) {
+    feature_exit_requested = true;
+    return;
+  }
+
+  tft.drawFastHLine(0, 19, 240, UI_LINE);
+  updateStatusBar();
+
+  if (s_inDetailView) {
+    if (isButtonPressedEdge(BTN_LEFT) ||
+        (featureHasTouchNavBar() && isTouchNavButtonPressedEdge(BTN_LEFT))) {
+      s_inDetailView = false;
+      rmDrawList();
+      redrawTouchButtonBar();
+    }
+    if (isButtonPressedEdge(BTN_RIGHT) ||
+        (featureHasTouchNavBar() && isTouchNavButtonPressedEdge(BTN_RIGHT))) {
+      rmTransmit(s_detailActualIdx);
+      tft.fillRect(5, 180, 230, 20, 0x0400);
+      tft.setTextColor(TFT_GREEN, 0x0400);
+      tft.setTextFont(2);
+      tft.setCursor(30, 182);
+      tft.print("TRANSMITTED!");
+      tft.setTextFont(1);
+      delay(800);
+      rmDrawDetail(s_detailActualIdx);
+      redrawTouchButtonBar();
+    }
+    delay(50);
+    return;
+  }
+
+  const int filteredCount = rmFilteredCount();
+  const int perPage = rmRowsPerPage();
+
+  if (isButtonPressedEdge(BTN_UP) && s_selIdx > 0) {
+    s_selIdx--;
+    rmDrawList();
+    redrawTouchButtonBar();
+  }
+  if (isButtonPressedEdge(BTN_DOWN) && s_selIdx < filteredCount - 1) {
+    s_selIdx++;
+    rmDrawList();
+    redrawTouchButtonBar();
+  }
+  if (isButtonPressedEdge(BTN_LEFT) ||
+      (featureHasTouchNavBar() && isTouchNavButtonPressedEdge(BTN_LEFT))) {
+    s_filterCategory = (s_filterCategory + 1) % (kNumCategories + 1);
+    s_showAll = (s_filterCategory == 0);
+    s_selIdx = 0;
+    rmDrawList();
+    redrawTouchButtonBar();
+  }
+  if (isButtonPressedEdge(BTN_RIGHT) ||
+      (featureHasTouchNavBar() && isTouchNavButtonPressedEdge(BTN_RIGHT))) {
+    int actualIdx = rmFilteredIndex(s_selIdx);
+    if (actualIdx >= 0) {
+      s_detailActualIdx = actualIdx;
+      s_inDetailView = true;
+      rmDrawDetail(actualIdx);
+      redrawTouchButtonBar();
+    }
+  }
+
+  delay(30);
+}
+
+}  // namespace RemoteManager
+
+
+// ============================================================================
+//  Wireless Doorbell Hijack
+//  Capture / Replay / Brute common doorbell codes on 433.92 MHz (default).
+//  BTN_LEFT  = CAPTURE mode toggle
+//  BTN_RIGHT = REPLAY (single ring of captured code)
+//  BTN_DOWN  = BRUTE  (cycle common doorbell codes)
+//  BTN_UP    = change frequency (next in list)
+//  BTN_SELECT/Exit = leave feature
+// ============================================================================
+
+namespace DoorbellHijack {
+
+static constexpr uint8_t DH_RX_PIN = SUBGHZ_RX_PIN;
+static constexpr uint8_t DH_TX_PIN = SUBGHZ_TX_PIN;
+
+static const uint32_t kDoorbellFreqList[] = {
+    300000000, 303875000, 304250000, 310000000, 314000000, 315000000,
+    318000000, 390000000, 418000000, 433075000, 433420000, 433920000,
+    434420000, 434775000, 438900000, 868350000, 915000000, 925000000
+};
+static constexpr int kDoorbellFreqCount =
+    (int)(sizeof(kDoorbellFreqList) / sizeof(kDoorbellFreqList[0]));
+
+// Common fixed doorbell codes observed in the wild (value, bitLength).
+struct DoorbellCode {
+  uint32_t value;
+  uint8_t  bits;
+};
+
+static const DoorbellCode kBruteCodes[] = {
+  { 0x1,    8 }, { 0x2,    8 }, { 0x55,   8 }, { 0xAA,   8 },
+  { 0xFF,   8 }, { 0x0,    8 }, { 0x3,    8 }, { 0xF,    8 },
+  { 0x10,   8 }, { 0x33,   8 }, { 0xCC,   8 }, { 0x80,   8 },
+  { 0x155, 12 }, { 0x2AA, 12 }, { 0x3FF, 12 }, { 0x7FF, 12 },
+  { 0xFFF, 12 }, { 0x800, 12 }, { 0x555, 12 }, { 0xAAA, 12 },
+  { 0x1FF, 12 }, { 0x5,   12 }, { 0xA,   12 }, { 0x50,  12 }
+};
+static constexpr int kBruteCodeCount =
+    (int)(sizeof(kBruteCodes) / sizeof(kBruteCodes[0]));
+
+static RCSwitch s_dhSwitch;
+
+enum DhMode : uint8_t { DH_CAPTURE = 0, DH_REPLAY = 1 };
+
+static DhMode    s_mode          = DH_CAPTURE;
+static int       s_freqIdx       = 11;   // 433.920 MHz
+static uint32_t  s_capValue      = 0;
+static uint16_t  s_capBitLen     = 0;
+static uint16_t  s_capProtocol   = 0;
+static uint32_t  s_ringCount     = 0;
+static bool      s_rxArmed       = false;
+static bool      s_uiDrawn       = false;
+static bool      s_bruteRunning  = false;
+static int       s_bruteIdx      = 0;
+static uint32_t  s_lastBruteMs   = 0;
+static unsigned long s_lastDebounce = 0;
+static constexpr unsigned long kDhDebounceMs = 200;
+
+static String    s_lastStatus;   // transient status line text
+static uint32_t  s_statusUntilMs = 0;
+
+struct __attribute__((packed)) DoorbellCapture {
+  uint32_t frequency;
+  uint32_t value;
+  uint16_t bitLength;
+  uint16_t protocol;
+};
+
+// ---- small helpers ---------------------------------------------------------
+
+static float dhFreqMHz() {
+  return kDoorbellFreqList[s_freqIdx % kDoorbellFreqCount] / 1000000.0f;
+}
+
+static void dhShowStatus(const char* msg, uint32_t holdMs = 1500) {
+  s_lastStatus   = String(msg);
+  s_statusUntilMs = millis() + holdMs;
+}
+
+static void dhArmReceive() {
+  pinMode(DH_RX_PIN, INPUT);
+  pinMode(DH_TX_PIN, INPUT);
+  s_dhSwitch.enableReceive(DH_RX_PIN);
+  s_dhSwitch.resetAvailable();
+  s_rxArmed = true;
+}
+
+static void dhDisarmReceive() {
+  if (!s_rxArmed) return;
+  s_dhSwitch.disableReceive();
+  s_rxArmed = false;
+}
+
+static void dhTuneRx() {
+  ELECHOUSE_cc1101.setSidle();
+  ELECHOUSE_cc1101.setMHZ(dhFreqMHz());
+  ELECHOUSE_cc1101.SetRx();
+  s_dhSwitch.resetAvailable();
+}
+
+static void dhTuneTx() {
+  ELECHOUSE_cc1101.setSidle();
+  ELECHOUSE_cc1101.setMHZ(dhFreqMHz());
+  ELECHOUSE_cc1101.SetTx();
+}
+
+static void dhRadioInit() {
+  holdSdInactiveOnSharedSpi();
+  reclaimSharedSpiBus();
+#if defined(SD_CS)
+  pinMode(SD_CS, OUTPUT);
+  digitalWrite(SD_CS, HIGH);
+#endif
+#if defined(CC1101_CS)
+  pinMode(CC1101_CS, OUTPUT);
+  digitalWrite(CC1101_CS, HIGH);
+#endif
+  ELECHOUSE_cc1101.setSpiPin(CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CS);
+  ELECHOUSE_cc1101.setGDO(CC1101_GDO0, CC1101_GDO2);
+  ELECHOUSE_cc1101.Init();
+  ELECHOUSE_cc1101.setCCMode(0);
+  ELECHOUSE_cc1101.setModulation(2);
+  ELECHOUSE_cc1101.setRxBW(500.0);
+  ELECHOUSE_cc1101.setPA(12);
+  ELECHOUSE_cc1101.setSidle();
+}
+
+static void dhExitCleanup() {
+  dhDisarmReceive();
+  s_dhSwitch.disableTransmit();
+  ELECHOUSE_cc1101.setSidle();
+  pinMode(DH_TX_PIN, INPUT);
+  pinMode(DH_RX_PIN, INPUT);
+  restoreSdAfterSharedSpi();
+}
+
+// ---- SD save ---------------------------------------------------------------
+
+static bool dhSaveCaptureToSD() {
+  if (s_capValue == 0 || s_capBitLen == 0) {
+    dhShowStatus("Nothing to save");
+    return false;
+  }
+
+  restoreSdAfterSharedSpi();
+  if (!isSDCardAvailable()) {
+    dhShowStatus("SD unavailable");
+    return false;
+  }
+  if (!SD.exists("/subghz")) SD.mkdir("/subghz");
+
+  // find next free doorbell_XXXX.bin
+  char path[40];
+  for (uint16_t i = 0; i < 10000; i++) {
+    snprintf(path, sizeof(path), "/subghz/doorbell_%04u.bin", (unsigned)i);
+    if (!SD.exists(path)) break;
+  }
+
+  File f = SD.open(path, FILE_WRITE);
+  if (!f) {
+    dhShowStatus("SD open fail");
+    return false;
+  }
+
+  DoorbellCapture rec;
+  rec.frequency = kDoorbellFreqList[s_freqIdx % kDoorbellFreqCount];
+  rec.value     = s_capValue;
+  rec.bitLength = s_capBitLen;
+  rec.protocol  = s_capProtocol;
+
+  bool ok = (f.write((const uint8_t*)&rec, sizeof(rec)) == sizeof(rec));
+  f.close();
+
+  if (ok) {
+    char msg[48];
+    snprintf(msg, sizeof(msg), "Saved %s", path);
+    dhShowStatus(msg, 2500);
+  } else {
+    dhShowStatus("SD write fail");
+  }
+  return ok;
+}
+
+// ---- transmit helpers ------------------------------------------------------
+
+static void dhSendOne(uint32_t value, uint16_t bits, uint16_t proto) {
+  dhDisarmReceive();
+  delay(80);
+
+  reclaimSharedSpiBus();
+#if defined(SD_CS)
+  pinMode(SD_CS, OUTPUT);
+  digitalWrite(SD_CS, HIGH);
+#endif
+#if defined(CC1101_CS)
+  pinMode(CC1101_CS, OUTPUT);
+  digitalWrite(CC1101_CS, HIGH);
+#endif
+  ELECHOUSE_cc1101.setSpiPin(CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CS);
+  ELECHOUSE_cc1101.setGDO(CC1101_GDO0, CC1101_GDO2);
+  ELECHOUSE_cc1101.setSidle();
+  ELECHOUSE_cc1101.setMHZ(dhFreqMHz());
+  ELECHOUSE_cc1101.setCCMode(0);
+  ELECHOUSE_cc1101.setModulation(2);
+  ELECHOUSE_cc1101.setPA(12);
+
+  pinMode(DH_TX_PIN, OUTPUT);
+  digitalWrite(DH_TX_PIN, LOW);
+  s_dhSwitch.enableTransmit(DH_TX_PIN);
+  dhTuneTx();
+
+  s_dhSwitch.setProtocol(proto > 0 ? proto : 1);
+  s_dhSwitch.send(value, bits);
+  delay(50);
+
+  s_dhSwitch.disableTransmit();
+  pinMode(DH_TX_PIN, INPUT);
+  pinMode(DH_RX_PIN, INPUT);
+  ELECHOUSE_cc1101.setSidle();
+  dhTuneRx();
+  delay(30);
+  dhArmReceive();
+}
+
+static void dhReplayCaptured() {
+  if (s_capValue == 0 || s_capBitLen == 0) {
+    dhShowStatus("No capture yet");
+    return;
+  }
+  dhSendOne(s_capValue, s_capBitLen, s_capProtocol);
+  s_ringCount++;
+  dhShowStatus("Rung!", 1200);
+}
+
+static void dhBruteStep() {
+  if (s_bruteIdx >= kBruteCodeCount) {
+    s_bruteRunning = false;
+    s_bruteIdx = 0;
+    dhShowStatus("Brute done", 2000);
+    return;
+  }
+
+  uint32_t now = millis();
+  if (now - s_lastBruteMs < 200) return;
+  s_lastBruteMs = now;
+
+  const DoorbellCode& c = kBruteCodes[s_bruteIdx];
+  dhSendOne(c.value, c.bits, 1);
+  s_ringCount++;
+
+  s_bruteIdx++;
+  if (s_bruteIdx >= kBruteCodeCount) {
+    s_bruteRunning = false;
+    s_bruteIdx = 0;
+    dhShowStatus("Brute done", 2000);
+  }
+}
+
+// ---- display ---------------------------------------------------------------
+
+static void dhDrawStaticChrome() {
+  if (s_uiDrawn) return;
+
+  subghzClearBody(TFT_BLACK);
+  tft.setTextFont(1);
+  tft.setTextSize(1);
+
+  tft.drawFastHLine(0, 19, 240, UI_LINE);
+
+  tft.setTextColor(UI_DIM_TEXT, TFT_BLACK);
+  tft.setCursor(5, 24);
+  tft.print("Mode:");
+  tft.setCursor(5, 38);
+  tft.print("Freq:");
+  tft.setCursor(5, 52);
+  tft.print("Code:");
+  tft.setCursor(5, 66);
+  tft.print("Bits:");
+  tft.setCursor(130, 66);
+  tft.print("Proto:");
+  tft.setCursor(5, 80);
+  tft.print("Rings:");
+
+  tft.drawFastHLine(0, 96, 240, UI_LINE);
+
+  tft.setTextColor(UI_DIM_TEXT, TFT_BLACK);
+  tft.setCursor(5, 104);
+  tft.print("L=Capture R=Replay");
+  tft.setCursor(5, 116);
+  tft.print("D=Brute U=Freq");
+
+  s_uiDrawn = true;
+}
+
+static void dhDrawDynamic() {
+  if (!s_uiDrawn) dhDrawStaticChrome();
+
+  tft.setTextFont(1);
+  tft.setTextSize(1);
+
+  // Mode
+  tft.fillRect(50, 24, 100, 12, TFT_BLACK);
+  tft.setTextColor(s_mode == DH_CAPTURE ? TFT_GREEN : TFT_CYAN, TFT_BLACK);
+  tft.setCursor(50, 24);
+  tft.print(s_mode == DH_CAPTURE ? "CAPTURE" : "REPLAY");
+
+  // Freq
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%.3f MHz", dhFreqMHz());
+  tft.fillRect(50, 38, 120, 12, TFT_BLACK);
+  tft.setTextColor(UI_WARN, TFT_BLACK);
+  tft.setCursor(50, 38);
+  tft.print(buf);
+
+  // Code
+  snprintf(buf, sizeof(buf), "0x%lX", (unsigned long)s_capValue);
+  tft.fillRect(50, 52, 130, 12, TFT_BLACK);
+  tft.setTextColor(s_capValue ? TFT_YELLOW : UI_DIM_TEXT, TFT_BLACK);
+  tft.setCursor(50, 52);
+  tft.print(s_capValue ? buf : "---");
+
+  // Bits / Proto
+  snprintf(buf, sizeof(buf), "%u", (unsigned)s_capBitLen);
+  tft.fillRect(50, 66, 40, 12, TFT_BLACK);
+  tft.setTextColor(UI_WARN, TFT_BLACK);
+  tft.setCursor(50, 66);
+  tft.print(s_capValue ? buf : "--");
+
+  snprintf(buf, sizeof(buf), "%u", (unsigned)s_capProtocol);
+  tft.fillRect(170, 66, 40, 12, TFT_BLACK);
+  tft.setTextColor(UI_WARN, TFT_BLACK);
+  tft.setCursor(170, 66);
+  tft.print(s_capValue ? buf : "--");
+
+  // Ring count
+  snprintf(buf, sizeof(buf), "%lu", (unsigned long)s_ringCount);
+  tft.fillRect(50, 80, 100, 12, TFT_BLACK);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.setCursor(50, 80);
+  tft.print(buf);
+
+  // Brute progress
+  if (s_bruteRunning) {
+    snprintf(buf, sizeof(buf), "Brute %d/%d", s_bruteIdx + 1, kBruteCodeCount);
+    tft.fillRect(5, 130, 230, 12, TFT_BLACK);
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.setCursor(5, 130);
+    tft.print(buf);
+  } else {
+    tft.fillRect(5, 130, 230, 12, TFT_BLACK);
+  }
+
+  // Transient status
+  uint32_t now = millis();
+  if (s_statusUntilMs != 0 && (int32_t)(now - s_statusUntilMs) < 0) {
+    tft.fillRect(5, 144, 230, 12, TFT_BLACK);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setCursor(5, 144);
+    tft.print(s_lastStatus);
+  } else if (s_statusUntilMs != 0) {
+    s_statusUntilMs = 0;
+    s_lastStatus = "";
+    tft.fillRect(5, 144, 230, 12, TFT_BLACK);
+  }
+}
+
+// ---- nav / input -----------------------------------------------------------
+
+static void dhHandleNavButtons() {
+  if (!featureHasTouchNavBar()) return;
+
+  if (isTouchNavButtonPressedEdge(BTN_LEFT)) {
+    s_mode = DH_CAPTURE;
+    s_bruteRunning = false;
+    dhShowStatus("CAPTURE mode");
+  }
+  if (isTouchNavButtonPressedEdge(BTN_RIGHT)) {
+    dhReplayCaptured();
+  }
+  if (isTouchNavButtonPressedEdge(BTN_DOWN)) {
+    if (!s_bruteRunning) {
+      s_bruteRunning = true;
+      s_bruteIdx = 0;
+      s_lastBruteMs = 0;
+      dhShowStatus("Brute start");
+    }
+  }
+  if (isTouchNavButtonPressedEdge(BTN_UP)) {
+    s_freqIdx = (s_freqIdx + 1) % kDoorbellFreqCount;
+    dhTuneRx();
+    char msg[32];
+    snprintf(msg, sizeof(msg), "Freq %.3f MHz", dhFreqMHz());
+    dhShowStatus(msg, 1200);
+  }
+}
+
+static void dhHandlePhysicalButtons() {
+  unsigned long now = millis();
+  if (now - s_lastDebounce < kDhDebounceMs) return;
+
+  if (isButtonPressed(BTN_LEFT)) {
+    s_lastDebounce = now;
+    s_mode = DH_CAPTURE;
+    s_bruteRunning = false;
+    dhShowStatus("CAPTURE mode");
+  }
+  if (isButtonPressed(BTN_RIGHT)) {
+    s_lastDebounce = now;
+    dhReplayCaptured();
+  }
+  if (isButtonPressed(BTN_DOWN)) {
+    s_lastDebounce = now;
+    if (!s_bruteRunning) {
+      s_bruteRunning = true;
+      s_bruteIdx = 0;
+      s_lastBruteMs = 0;
+      dhShowStatus("Brute start");
+    }
+  }
+  if (isButtonPressed(BTN_UP)) {
+    s_lastDebounce = now;
+    s_freqIdx = (s_freqIdx + 1) % kDoorbellFreqCount;
+    dhTuneRx();
+    char msg[32];
+    snprintf(msg, sizeof(msg), "Freq %.3f MHz", dhFreqMHz());
+    dhShowStatus(msg, 1200);
+  }
+}
+
+// ---- public API ------------------------------------------------------------
+
+void doorbellSetup() {
+  pauseBackgroundRadioTasks();
+  setTouchButtonInputEnabled(true);
+  setTouchNavLabels("Capture", "Brute", "Exit", "Freq", "Replay");
+
+  s_mode         = DH_CAPTURE;
+  s_capValue     = 0;
+  s_capBitLen    = 0;
+  s_capProtocol  = 0;
+  s_ringCount    = 0;
+  s_bruteRunning = false;
+  s_bruteIdx     = 0;
+  s_lastBruteMs  = 0;
+  s_statusUntilMs = 0;
+  s_lastStatus   = "";
+  s_uiDrawn      = false;
+  s_rxArmed      = false;
+
+  dhRadioInit();
+  dhTuneRx();
+
+  pinMode(DH_RX_PIN, INPUT);
+  pinMode(DH_TX_PIN, INPUT);
+  s_dhSwitch.setRepeatTransmit(8);
+  delay(50);
+  dhArmReceive();
+
+#if HAS_PCF8574_BUTTONS
+  pcf.pinMode(BTN_LEFT, INPUT_PULLUP);
+  pcf.pinMode(BTN_RIGHT, INPUT_PULLUP);
+  pcf.pinMode(BTN_UP, INPUT_PULLUP);
+  pcf.pinMode(BTN_DOWN, INPUT_PULLUP);
+  pcf.pinMode(BTN_SELECT, INPUT_PULLUP);
+#endif
+
+  tft.setRotation(TFT_ROTATION);
+  subghzClearBody(TFT_BLACK);
+  drawStatusBar(readBatteryVoltage(), true);
+  subghzRedrawNavChrome();
+  setupTouchscreen();
+
+  s_uiDrawn = false;
+  dhDrawDynamic();
+  subghzRedrawNavChrome();
+  dhShowStatus("Ready — CAPTURE", 2000);
+}
+
+void doorbellLoop() {
+  if (feature_active && (isButtonPressed(BTN_SELECT) || featureExitButtonPressed())) {
+    dhExitCleanup();
+    feature_exit_requested = true;
+    return;
+  }
+
+  maintainTouchNavBar();
+
+  // Capture: poll RCSwitch for incoming signals.
+  if (s_mode == DH_CAPTURE && s_rxArmed && !s_bruteRunning) {
+    if (s_dhSwitch.available()) {
+      uint32_t val = s_dhSwitch.getReceivedValue();
+      if (val != 0) {
+        s_capValue    = val;
+        s_capBitLen   = s_dhSwitch.getReceivedBitlength();
+        s_capProtocol = s_dhSwitch.getReceivedProtocol();
+
+        char msg[64];
+        snprintf(msg, sizeof(msg), "CAP 0x%lX %ub p%u",
+                 (unsigned long)s_capValue,
+                 (unsigned)s_capBitLen,
+                 (unsigned)s_capProtocol);
+        dhShowStatus(msg, 2500);
+
+        dhSaveCaptureToSD();
+      }
+      s_dhSwitch.resetAvailable();
+    }
+  }
+
+  // Brute: step through common codes.
+  if (s_bruteRunning) {
+    dhBruteStep();
+  }
+
+  dhHandleNavButtons();
+  dhHandlePhysicalButtons();
+
+  dhDrawDynamic();
+
+  if (s_uiDrawn) {
+    tft.drawFastHLine(0, 19, 240, UI_LINE);
+  }
+
+  delay(10);
+}
+
+}  // namespace DoorbellHijack
+
+// =============================================================================
+// Universal RF Cloner — capture → replay workflow with CC1101 + RCSwitch.
+// Appended after namespace RemoteManager.
+// =============================================================================
+
+namespace RfCloner {
+
+// Local frequency list and RCSwitch (the ones in replayat namespace are not accessible)
+static const uint32_t cloner_freq_list[] = {
+    300000000, 303875000, 304250000, 310000000, 314000000, 315000000,
+    318000000, 390000000, 418000000, 433075000, 433420000, 433920000,
+    434420000, 434775000, 438900000, 868350000, 915000000, 925000000
+};
+static RCSwitch clonerSwitch;
+
+// ---- Frequency table --------------------------------------------------------
+static constexpr uint16_t CLONER_FREQ_COUNT =
+    (uint16_t)(sizeof(cloner_freq_list) / sizeof(cloner_freq_list[0]));
+static constexpr uint16_t CLONER_DEFAULT_FREQ_IDX = 10;  // 433920000
+
+// ---- Capture state ----------------------------------------------------------
+static uint16_t  clonerFreqIdx     = CLONER_DEFAULT_FREQ_IDX;
+static uint32_t  capturedValue     = 0;
+static uint16_t  capturedBitLength = 0;
+static uint16_t  capturedProtocol  = 0;
+static bool      hasCaptured       = false;
+static bool      rxArmed           = false;
+
+// ---- UI state ---------------------------------------------------------------
+static String    clonerStatus      = "Ready";
+static uint16_t  clonerStatusColor = UI_TEXT;
+static bool      clonerUiDrawn     = false;
+
+// ---- Layout constants -------------------------------------------------------
+static constexpr int kClonerLineH   = 14;
+static constexpr int kClonerPadX    = 8;
+static constexpr int kClonerTopY    = 24;
+static constexpr int kClonerLabelW  = 72;
+
+// ---- Packed on-disk record --------------------------------------------------
+struct __attribute__((packed)) ClonerCapture {
+  uint32_t frequency;
+  uint32_t value;
+  uint16_t bitLength;
+  uint16_t protocol;
+};
+
+// ---------------------------------------------------------------------------
+// CC1101 helpers
+// ---------------------------------------------------------------------------
+static void clonerInitCC1101() {
+  reclaimSharedSpiBus();
+
+#if defined(SD_CS)
+  pinMode(SD_CS, OUTPUT);
+  digitalWrite(SD_CS, HIGH);
+#endif
+#if defined(CC1101_CS)
+  pinMode(CC1101_CS, OUTPUT);
+  digitalWrite(CC1101_CS, HIGH);
+#endif
+
+  ELECHOUSE_cc1101.setSpiPin(CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CS);
+  ELECHOUSE_cc1101.setGDO(CC1101_GDO0, CC1101_GDO2);
+  ELECHOUSE_cc1101.Init();
+  ELECHOUSE_cc1101.setModulation(2);
+  ELECHOUSE_cc1101.setRxBW(500.0);
+  ELECHOUSE_cc1101.setMHZ(cloner_freq_list[clonerFreqIdx] / 1000000.0);
+  ELECHOUSE_cc1101.SetRx();
+}
+
+static void clonerTuneTo(uint16_t idx) {
+  clonerFreqIdx = idx % CLONER_FREQ_COUNT;
+  ELECHOUSE_cc1101.setSidle();
+  ELECHOUSE_cc1101.setMHZ(cloner_freq_list[clonerFreqIdx] / 1000000.0);
+  ELECHOUSE_cc1101.SetRx();
+}
+
+// ---------------------------------------------------------------------------
+// RCSwitch arming (mirrors replayArmReceive / replayDisarmReceive semantics
+// but uses local state so we never desync the file-scope s_replayRxArmed).
+// ---------------------------------------------------------------------------
+static void clonerArmReceive() {
+  if (rxArmed) return;
+  pinMode(SUBGHZ_RX_PIN, INPUT);
+  pinMode(SUBGHZ_TX_PIN, INPUT);
+  clonerSwitch.enableReceive(SUBGHZ_RX_PIN);
+  clonerSwitch.resetAvailable();
+  rxArmed = true;
+}
+
+static void clonerDisarmReceive() {
+  if (!rxArmed) return;
+  clonerSwitch.disableReceive();
+  rxArmed = false;
+}
+
+// ---------------------------------------------------------------------------
+// Display
+// ---------------------------------------------------------------------------
+static String clonerFreqString() {
+  const uint32_t mhz = cloner_freq_list[clonerFreqIdx] / 1000000UL;
+  const uint32_t khz = (cloner_freq_list[clonerFreqIdx] / 1000UL) % 1000UL;
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%lu.%03lu", (unsigned long)mhz, (unsigned long)khz);
+  return String(buf);
+}
+
+static void clonerDrawUI() {
+  subghzClearBody(TFT_BLACK);
+  tft.setTextFont(1);
+  tft.setTextSize(1);
+
+  // Header
+  tft.drawFastHLine(0, 19, 240, UI_LINE);
+  tft.setTextColor(FEATURE_TEXT, TFT_BLACK);
+  tft.setCursor(kClonerPadX, kClonerTopY);
+  tft.print("RF CLONER");
+
+  // Status line
+  tft.setTextColor(clonerStatusColor, TFT_BLACK);
+  tft.setCursor(kClonerPadX, kClonerTopY + kClonerLineH);
+  tft.print(clonerStatus);
+
+  // Info block
+  int y = kClonerTopY + (kClonerLineH * 3);
+
+  // Frequency
+  tft.setTextColor(UI_TEXT, TFT_BLACK);
+  tft.setCursor(kClonerPadX, y);
+  tft.print("Freq:");
+  tft.setCursor(kClonerPadX + kClonerLabelW, y);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.print(clonerFreqString());
+  tft.print(" MHz");
+  y += kClonerLineH;
+
+  // Protocol
+  tft.setTextColor(UI_TEXT, TFT_BLACK);
+  tft.setCursor(kClonerPadX, y);
+  tft.print("Protocol:");
+  tft.setCursor(kClonerPadX + kClonerLabelW, y);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  if (hasCaptured) {
+    tft.print(capturedProtocol);
+  } else {
+    tft.setTextColor(UI_TEXT, TFT_BLACK);
+    tft.print("--");
+  }
+  y += kClonerLineH;
+
+  // Bit length
+  tft.setTextColor(UI_TEXT, TFT_BLACK);
+  tft.setCursor(kClonerPadX, y);
+  tft.print("Bits:");
+  tft.setCursor(kClonerPadX + kClonerLabelW, y);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  if (hasCaptured) {
+    tft.print(capturedBitLength);
+  } else {
+    tft.setTextColor(UI_TEXT, TFT_BLACK);
+    tft.print("--");
+  }
+  y += kClonerLineH;
+
+  // Value (decimal)
+  tft.setTextColor(UI_TEXT, TFT_BLACK);
+  tft.setCursor(kClonerPadX, y);
+  tft.print("Value:");
+  tft.setCursor(kClonerPadX + kClonerLabelW, y);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  if (hasCaptured) {
+    tft.print((unsigned long)capturedValue);
+  } else {
+    tft.setTextColor(UI_TEXT, TFT_BLACK);
+    tft.print("--");
+  }
+  y += kClonerLineH;
+
+  // Value (hex)
+  tft.setTextColor(UI_TEXT, TFT_BLACK);
+  tft.setCursor(kClonerPadX, y);
+  tft.print("Hex:");
+  tft.setCursor(kClonerPadX + kClonerLabelW, y);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  if (hasCaptured) {
+    char hexbuf[20];
+    snprintf(hexbuf, sizeof(hexbuf), "0x%lX", (unsigned long)capturedValue);
+    tft.print(hexbuf);
+  } else {
+    tft.setTextColor(UI_TEXT, TFT_BLACK);
+    tft.print("--");
+  }
+  y += kClonerLineH * 2;
+
+  // Hint text
+  tft.setTextColor(UI_TEXT, TFT_BLACK);
+  tft.setCursor(kClonerPadX, y);
+  tft.print("Capture: BTN-L / Replay: BTN-R");
+  y += kClonerLineH;
+  tft.setCursor(kClonerPadX, y);
+  tft.print("Freq: UP / DOWN");
+
+  clonerUiDrawn = true;
+}
+
+static void clonerSetStatus(const char* msg, uint16_t color) {
+  clonerStatus      = msg;
+  clonerStatusColor = color;
+  clonerUiDrawn     = false;
+}
+
+// ---------------------------------------------------------------------------
+// SD save — /subghz/cloner_XXXX.bin
+// ---------------------------------------------------------------------------
+static bool clonerSaveToSD() {
+  restoreSdAfterSharedSpi();
+  if (!isSDCardAvailable()) {
+    clonerSetStatus("No SD card", TFT_RED);
+    return false;
+  }
+
+  if (!SD.exists(SUBGHZ_DIR)) {
+    SD.mkdir(SUBGHZ_DIR);
+    if (!SD.exists(SUBGHZ_DIR)) {
+      clonerSetStatus("Mkdir failed", TFT_RED);
+      return false;
+    }
+  }
+
+  for (uint16_t i = 0; i < 10000; i++) {
+    char path[32];
+    snprintf(path, sizeof(path), "%s/cloner_%04u.bin", SUBGHZ_DIR, (unsigned)i);
+    if (SD.exists(path)) continue;
+
+    File f = SD.open(path, FILE_WRITE);
+    if (!f) {
+      clonerSetStatus("File open fail", TFT_RED);
+      return false;
+    }
+
+    ClonerCapture rec;
+    rec.frequency  = cloner_freq_list[clonerFreqIdx];
+    rec.value      = capturedValue;
+    rec.bitLength  = capturedBitLength;
+    rec.protocol   = capturedProtocol;
+
+    const size_t written = f.write((const uint8_t*)&rec, sizeof(rec));
+    f.close();
+
+    if (written != sizeof(rec)) {
+      clonerSetStatus("Write failed", TFT_RED);
+      return false;
+    }
+
+    char okmsg[32];
+    snprintf(okmsg, sizeof(okmsg), "Saved cloner_%04u.bin", (unsigned)i);
+    clonerSetStatus(okmsg, TFT_GREEN);
+    return true;
+  }
+
+  clonerSetStatus("No free slot", TFT_RED);
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Capture
+// ---------------------------------------------------------------------------
+static void clonerDoCapture() {
+  clonerDisarmReceive();
+  delay(50);
+
+  // Re-init CC1101 in RX on current frequency
+  ELECHOUSE_cc1101.setSidle();
+  ELECHOUSE_cc1101.setMHZ(cloner_freq_list[clonerFreqIdx] / 1000000.0);
+  ELECHOUSE_cc1101.SetRx();
+  delay(20);
+
+  clonerArmReceive();
+  clonerSetStatus("Capturing...", TFT_CYAN);
+  clonerDrawUI();
+
+  // Wait up to 5 s for a decode
+  const uint32_t timeout = millis() + 5000;
+  bool gotSignal = false;
+
+  while ((int32_t)(millis() - timeout) < 0) {
+    if (feature_exit_requested || featureExitButtonPressed()) {
+      clonerDisarmReceive();
+      return;
+    }
+    if (featureHasTouchNavBar()) {
+      maintainTouchNavBar();
+    }
+
+    if (clonerSwitch.available()) {
+      const uint32_t val  = clonerSwitch.getReceivedValue();
+      const uint16_t bits = clonerSwitch.getReceivedBitlength();
+      const uint16_t proto = clonerSwitch.getReceivedProtocol();
+      clonerSwitch.resetAvailable();
+
+      if (val != 0 && bits >= 8 && bits <= 64 && proto >= 1 && proto <= 12) {
+        capturedValue     = val;
+        capturedBitLength = bits;
+        capturedProtocol  = proto;
+        hasCaptured       = true;
+        gotSignal         = true;
+        break;
+      }
+    }
+    delay(10);
+  }
+
+  clonerDisarmReceive();
+
+  if (gotSignal) {
+    clonerSetStatus("Captured!", TFT_GREEN);
+    // Auto-save to SD
+    clonerSaveToSD();
+  } else {
+    clonerSetStatus("No signal", TFT_RED);
+  }
+  clonerDrawUI();
+}
+
+// ---------------------------------------------------------------------------
+// Replay
+// ---------------------------------------------------------------------------
+static void clonerDoReplay() {
+  if (!hasCaptured) {
+    clonerSetStatus("Nothing to replay", TFT_RED);
+    clonerDrawUI();
+    return;
+  }
+
+  clonerDisarmReceive();
+  delay(50);
+
+  // Set CC1101 to TX on captured frequency
+  ELECHOUSE_cc1101.setSidle();
+  ELECHOUSE_cc1101.setMHZ(cloner_freq_list[clonerFreqIdx] / 1000000.0);
+
+  pinMode(SUBGHZ_TX_PIN, OUTPUT);
+  clonerSwitch.enableTransmit(SUBGHZ_TX_PIN);
+  clonerSwitch.setProtocol(capturedProtocol);
+  ELECHOUSE_cc1101.SetTx();
+  delay(20);
+
+  clonerSetStatus("Replaying...", TFT_CYAN);
+  clonerDrawUI();
+
+  // Send with a few repeats for reliability
+  clonerSwitch.setRepeatTransmit(8);
+  clonerSwitch.send(capturedValue, capturedBitLength);
+  delay(300);
+
+  clonerSwitch.disableTransmit();
+  pinMode(SUBGHZ_TX_PIN, INPUT);
+  pinMode(SUBGHZ_RX_PIN, INPUT);
+
+  // Back to RX
+  ELECHOUSE_cc1101.SetRx();
+  delay(50);
+  clonerArmReceive();
+
+  clonerSetStatus("Replayed!", TFT_GREEN);
+  clonerDrawUI();
+}
+
+// ---------------------------------------------------------------------------
+// Exit cleanup
+// ---------------------------------------------------------------------------
+static void clonerExitCleanup() {
+  clonerDisarmReceive();
+  ELECHOUSE_cc1101.setSidle();
+  pinMode(SUBGHZ_RX_PIN, INPUT);
+  pinMode(SUBGHZ_TX_PIN, INPUT);
+  restoreSdAfterSharedSpi();
+}
+
+// ---------------------------------------------------------------------------
+// Setup
+// ---------------------------------------------------------------------------
+void rfClonerSetup() {
+  pauseBackgroundRadioTasks();
+  setTouchButtonInputEnabled(true);
+  setTouchNavLabels("Capture", "", "Exit", "", "Replay");
+
+  clonerDisarmReceive();
+  clonerSwitch.resetAvailable();
+
+  reclaimSharedSpiBus();
+  clonerInitCC1101();
+
+#if HAS_PCF8574_BUTTONS
+  pcf.pinMode(BTN_LEFT, INPUT_PULLUP);
+  pcf.pinMode(BTN_RIGHT, INPUT_PULLUP);
+  pcf.pinMode(BTN_UP, INPUT_PULLUP);
+  pcf.pinMode(BTN_DOWN, INPUT_PULLUP);
+  pcf.pinMode(BTN_SELECT, INPUT_PULLUP);
+#endif
+
+  // State defaults
+  clonerFreqIdx     = CLONER_DEFAULT_FREQ_IDX;
+  capturedValue     = 0;
+  capturedBitLength = 0;
+  capturedProtocol  = 0;
+  hasCaptured       = false;
+  clonerStatus      = "Ready";
+  clonerStatusColor = UI_TEXT;
+  clonerUiDrawn     = false;
+
+  tft.setRotation(TFT_ROTATION);
+  subghzClearBody(TFT_BLACK);
+
+  drawStatusBar(readBatteryVoltage(), true);
+  subghzRedrawNavChrome();
+  setupTouchscreen();
+
+  // Arm RX so we're ready to capture
+  clonerArmReceive();
+
+  clonerDrawUI();
+  subghzRedrawNavChrome();
+}
+
+// ---------------------------------------------------------------------------
+// Loop
+// ---------------------------------------------------------------------------
+void rfClonerLoop() {
+  // Exit
+  if (feature_active && (isButtonPressed(BTN_SELECT) || featureExitButtonPressed())) {
+    clonerExitCleanup();
+    feature_exit_requested = true;
+    return;
+  }
+
+  maintainTouchNavBar();
+
+  // Refresh UI if needed
+  if (!clonerUiDrawn) {
+    clonerDrawUI();
+    if (featureHasTouchNavBar()) {
+      redrawTouchButtonBar();
+    }
+  }
+
+  // ---- Button actions (edge-triggered with debounce) ---------------------
+
+  // Frequency up
+  if (isButtonPressedEdge(BTN_UP)) {
+    clonerDisarmReceive();
+    clonerTuneTo((uint16_t)((clonerFreqIdx + 1) % CLONER_FREQ_COUNT));
+    clonerArmReceive();
+    clonerSetStatus("Freq changed", TFT_CYAN);
+    clonerDrawUI();
+    delay(150);
+  }
+
+  // Frequency down
+  if (isButtonPressedEdge(BTN_DOWN)) {
+    clonerDisarmReceive();
+    clonerTuneTo((uint16_t)((clonerFreqIdx + CLONER_FREQ_COUNT - 1) % CLONER_FREQ_COUNT));
+    clonerArmReceive();
+    clonerSetStatus("Freq changed", TFT_CYAN);
+    clonerDrawUI();
+    delay(150);
+  }
+
+  // Capture (BTN_LEFT)
+  if (isButtonPressedEdge(BTN_LEFT)) {
+    clonerDoCapture();
+    delay(200);
+  }
+
+  // Replay (BTN_RIGHT)
+  if (isButtonPressedEdge(BTN_RIGHT)) {
+    clonerDoReplay();
+    delay(200);
+  }
+
+  // Periodic status bar update
+  updateStatusBar();
+  drawStatusBar(readBatteryVoltage(), false);
+
+  delay(30);
+}
+
+}  // namespace RfCloner
+
+// ============================================================================
+// RF Bug / Hidden Mic Detector
+// Sweeps SubGHz frequencies for continuous transmissions (wireless bugs).
+// Appended to subghz.cpp — uses existing project globals, helpers, and CC1101.
+// ============================================================================
+
+namespace BugDetector {
+
+// --- Constants -------------------------------------------------------------
+
+static const uint32_t kBugFreqList[] = {
+    300000000, 303875000, 304250000, 310000000, 314000000, 315000000,
+    318000000, 390000000, 418000000, 433075000, 433420000, 433920000,
+    434420000, 434775000, 438900000, 868350000, 915000000, 925000000
+};
+static const uint8_t kBugFreqCount = sizeof(kBugFreqList) / sizeof(kBugFreqList[0]);
+
+static constexpr int    kBugRssiThreshold   = -65;   // dBm — sustained signal
+static constexpr uint32_t kBugSustainMs     = 3000;  // >3 s above threshold = bug
+static constexpr uint32_t kBugSweepInterval = 2000;  // auto-sweep every 2 s
+static constexpr uint32_t kBugSettleMs      = 12;    // RX settle after SetRx
+static constexpr uint32_t kBugFlashInterval = 400;   // alert flash rate
+
+// Layout
+static constexpr int kBugTitleY     = 22;
+static constexpr int kBugBarTop     = 34;
+static constexpr int kBugBarH       = 8;
+static constexpr int kBugBarGap     = 2;
+static constexpr int kBugLabelY     = kBugBarTop + kBugBarH + 1;
+static constexpr int kBugListStartY = 34;
+static constexpr int kBugListRowH   = 14;
+
+static constexpr int kBugBarAreaX    = 4;
+static constexpr int kBugBarAreaW    = 232;
+static constexpr int kBugLabelWidth  = 52;
+static constexpr int kBugBarX        = kBugBarAreaX + kBugLabelWidth + 2;
+static constexpr int kBugBarMaxW     = kBugBarAreaW - kBugLabelWidth - 2 - 30; // leave room for dBm
+
+// --- State ------------------------------------------------------------------
+
+struct FreqState {
+  int      rssi;            // latest RSSI dBm
+  bool     aboveThreshold;  // currently above threshold this sweep
+  uint32_t aboveStartMs;    // when sustained signal began (0 = not active)
+  uint32_t sustainMs;       // accumulated sustained duration
+  bool     alerted;         // already alerted for this sustained event
+  int      peakRssi;        // peak RSSI during sustained event
+};
+
+static FreqState sFreq[kBugFreqCount];
+static uint32_t  sLastSweepMs   = 0;
+static uint8_t   sDisplayMode   = 0;   // 0 = bar graph, 1 = list
+static bool      sDisplayInvalid = true;
+static bool      sAlertActive    = false;
+static uint32_t  sFlashToggleMs  = 0;
+static bool      sFlashOn        = true;
+
+// Track which freqs are in alert to show on screen
+static uint8_t   sAlertFreqIdx    = 0;
+static bool      sAnyAlert        = false;
+
+// Button edge tracking
+static bool sPrevLeft = false, sPrevUp = false, sPrevDown = false;
+
+// --- Helpers ----------------------------------------------------------------
+
+static int bugContentBottom() {
+  return featureHasTouchNavBar() ? touchNavContentBottomY() : 320;
+}
+
+static void bugClearContent(uint16_t color = TFT_BLACK) {
+  if (featureHasTouchNavBar()) {
+    featureClearContent(color);
+  } else {
+    tft.fillScreen(color);
+  }
+}
+
+static void bugInitCC1101() {
+  ELECHOUSE_cc1101.setSpiPin(CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CS);
+  ELECHOUSE_cc1101.setGDO(CC1101_GDO0, CC1101_GDO2);
+  ELECHOUSE_cc1101.Init();
+  ELECHOUSE_cc1101.setModulation(2);
+  ELECHOUSE_cc1101.setRxBW(650.0);
+}
+
+static void bugTuneRx(uint32_t freqHz) {
+  ELECHOUSE_cc1101.setMHZ(freqHz / 1000000.0);
+  ELECHOUSE_cc1101.SetRx();
+  delay(kBugSettleMs);
+}
+
+static int bugReadRssi() {
+  // ELECHOUSE_cc1101.getRssi() returns dBm (negative, e.g. -90 quiet, -40 strong).
+  // Some library versions may not have it; fall back to GDO0 carrier detect.
+  int rssi = ELECHOUSE_cc1101.getRssi();
+  if (rssi == 0 || rssi < -130) {
+    // Fallback: GDO0 high means carrier/signal present — approximate as threshold
+    rssi = digitalRead(CC1101_GDO0) ? (kBugRssiThreshold + 5) : (kBugRssiThreshold - 20);
+  }
+  return rssi;
+}
+
+static String bugFreqLabel(uint32_t freqHz) {
+  float mhz = freqHz / 1000000.0f;
+  char buf[12];
+  if (mhz >= 800.0f) {
+    snprintf(buf, sizeof(buf), "%.0f", mhz);
+  } else {
+    snprintf(buf, sizeof(buf), "%.2f", mhz);
+  }
+  return String(buf) + "M";
+}
+
+// --- SD Logging -------------------------------------------------------------
+
+static void bugLogAlert(uint8_t idx, int rssi, uint32_t durationMs) {
+  restoreSdAfterSharedSpi();
+  if (!isSDCardAvailable()) return;
+
+  if (!SD.exists(LOG_DIR)) {
+    SD.mkdir(LOG_DIR);
+  }
+
+  File f = SD.open(LOG_DIR "/bugdetect.csv", FILE_APPEND);
+  if (!f) return;
+
+  uint32_t now = millis();
+  char freqBuf[16];
+  snprintf(freqBuf, sizeof(freqBuf), "%lu", (unsigned long)kBugFreqList[idx]);
+
+  f.printf("%lu,%s,%d,%lu\n",
+           (unsigned long)now,
+           freqBuf,
+           rssi,
+           (unsigned long)durationMs);
+  f.close();
+}
+
+// --- Sweep ------------------------------------------------------------------
+
+static void bugPerformSweep() {
+  reclaimSharedSpiBus();
+
+#if defined(SD_CS)
+  pinMode(SD_CS, OUTPUT);
+  digitalWrite(SD_CS, HIGH);
+#endif
+#if defined(CC1101_CS)
+  pinMode(CC1101_CS, OUTPUT);
+  digitalWrite(CC1101_CS, HIGH);
+#endif
+
+  bugInitCC1101();
+
+  sAnyAlert = false;
+
+  for (uint8_t i = 0; i < kBugFreqCount; i++) {
+    bugTuneRx(kBugFreqList[i]);
+
+    // Sample RSSI a couple times for stability
+    int rssi1 = bugReadRssi();
+    delay(3);
+    int rssi2 = bugReadRssi();
+    int rssi = (rssi1 + rssi2) / 2;
+
+    FreqState &fs = sFreq[i];
+    fs.rssi = rssi;
+
+    uint32_t now = millis();
+    bool above = (rssi >= kBugRssiThreshold);
+
+    if (above) {
+      if (!fs.aboveThreshold) {
+        // First detection this session
+        fs.aboveThreshold = true;
+        fs.aboveStartMs   = now;
+        fs.sustainMs      = 0;
+        fs.peakRssi       = rssi;
+        fs.alerted        = false;
+      } else {
+        // Accumulate sustained time
+        fs.sustainMs = now - fs.aboveStartMs;
+        if (rssi > fs.peakRssi) fs.peakRssi = rssi;
+      }
+
+      // Check for alert threshold (>3 seconds sustained)
+      if (fs.sustainMs >= kBugSustainMs && !fs.alerted) {
+        fs.alerted  = true;
+        sAlertActive = true;
+        sAnyAlert    = true;
+        sAlertFreqIdx = i;
+        sFlashOn      = true;
+        sFlashToggleMs = now;
+
+        // Log to SD
+        bugLogAlert(i, fs.peakRssi, fs.sustainMs);
+      }
+
+      if (fs.alerted) {
+        sAnyAlert = true;
+      }
+    } else {
+      // Signal dropped below threshold — reset sustained tracking
+      fs.aboveThreshold = false;
+      fs.aboveStartMs   = 0;
+      fs.sustainMs      = 0;
+      fs.alerted        = false;
+    }
+  }
+
+  // Return CC1101 to idle-ish RX to reduce power
+  ELECHOUSE_cc1101.SetRx();
+}
+
+// --- Display: Bar Graph -----------------------------------------------------
+
+static void bugDrawBarGraph() {
+  int bottomY = bugContentBottom();
+  int maxBars = (bottomY - kBugBarTop) / (kBugBarH + kBugBarGap);
+  if (maxBars < 1) maxBars = 1;
+  uint8_t showCount = (kBugFreqCount < maxBars) ? kBugFreqCount : maxBars;
+
+  tft.setTextFont(1);
+  tft.setTextSize(1);
+
+  for (uint8_t i = 0; i < showCount; i++) {
+    FreqState &fs = sFreq[i];
+    int y = kBugBarTop + i * (kBugBarH + kBugBarGap);
+
+    // Clear row
+    tft.fillRect(kBugBarAreaX, y, kBugBarAreaW, kBugBarH, TFT_BLACK);
+
+    // Frequency label
+    tft.setTextColor(UI_TEXT, TFT_BLACK);
+    tft.setCursor(kBugBarAreaX, y);
+    tft.print(bugFreqLabel(kBugFreqList[i]));
+
+    // Bar: map RSSI from [-100, -30] to [0, kBugBarMaxW]
+    int rssiClamped = fs.rssi;
+    if (rssiClamped < -100) rssiClamped = -100;
+    if (rssiClamped > -30)  rssiClamped = -30;
+    int barW = (int)((long)(rssiClamped + 100) * kBugBarMaxW / 70);
+    if (barW < 0) barW = 0;
+
+    uint16_t barColor;
+    if (fs.alerted) {
+      barColor = TFT_RED;
+    } else if (fs.aboveThreshold) {
+      barColor = TFT_YELLOW;
+    } else {
+      barColor = TFT_GREEN;
+    }
+
+    if (barW > 0) {
+      tft.fillRect(kBugBarX, y, barW, kBugBarH, barColor);
+    }
+
+    // dBm text after bar
+    tft.setTextColor(UI_LABLE, TFT_BLACK);
+    tft.setCursor(kBugBarX + kBugBarMaxW + 2, y);
+    tft.print(fs.rssi);
+  }
+
+  // Show count if truncated
+  if (showCount < kBugFreqCount) {
+    int y = kBugBarTop + showCount * (kBugBarH + kBugBarGap);
+    tft.setTextColor(UI_LABLE, TFT_BLACK);
+    tft.setCursor(kBugBarAreaX, y);
+    tft.printf("+%d more", kBugFreqCount - showCount);
+  }
+}
+
+// --- Display: List Mode -----------------------------------------------------
+
+static void bugDrawList() {
+  int bottomY = bugContentBottom();
+  int maxRows = (bottomY - kBugListStartY) / kBugListRowH;
+  if (maxRows < 1) maxRows = 1;
+  uint8_t showCount = (kBugFreqCount < maxRows) ? kBugFreqCount : maxRows;
+
+  tft.setTextFont(1);
+  tft.setTextSize(1);
+
+  for (uint8_t i = 0; i < showCount; i++) {
+    FreqState &fs = sFreq[i];
+    int y = kBugListStartY + i * kBugListRowH;
+
+    // Clear row
+    tft.fillRect(0, y, 240, kBugListRowH - 1, TFT_BLACK);
+
+    uint16_t color;
+    const char* tag;
+    if (fs.alerted) {
+      color = TFT_RED;
+      tag   = "BUG";
+    } else if (fs.aboveThreshold) {
+      color = TFT_YELLOW;
+      tag   = "SIG";
+    } else {
+      color = UI_TEXT;
+      tag   = "   ";
+    }
+
+    tft.setTextColor(color, TFT_BLACK);
+    tft.setCursor(2, y);
+    tft.printf("%s %-7s %4ddBm",
+               tag,
+               bugFreqLabel(kBugFreqList[i]).c_str(),
+               fs.rssi);
+
+    if (fs.aboveThreshold && fs.sustainMs > 0) {
+      tft.setTextColor(TFT_CYAN, TFT_BLACK);
+      tft.setCursor(150, y);
+      tft.printf("%lus", (unsigned long)(fs.sustainMs / 1000));
+    }
+  }
+}
+
+// --- Display: Alert Overlay -------------------------------------------------
+
+static void bugDrawAlertOverlay() {
+  if (!sAlertActive) return;
+
+  uint32_t now = millis();
+  if (now - sFlashToggleMs >= kBugFlashInterval) {
+    sFlashOn = !sFlashOn;
+    sFlashToggleMs = now;
+  }
+
+  // Draw alert box in center of content area
+  int boxW = 200;
+  int boxH = 50;
+  int boxX = (240 - boxW) / 2;
+  int boxY = kBugBarTop + 30;
+
+  uint16_t bgColor = sFlashOn ? TFT_RED : TFT_BLACK;
+  uint16_t fgColor = sFlashOn ? TFT_WHITE : TFT_RED;
+
+  tft.fillRoundRect(boxX, boxY, boxW, boxH, 4, bgColor);
+  tft.drawRoundRect(boxX, boxY, boxW, boxH, 4, TFT_RED);
+
+  tft.setTextFont(2);
+  tft.setTextSize(1);
+  tft.setTextColor(fgColor, bgColor);
+  tft.setCursor(boxX + 16, boxY + 4);
+  tft.print("BUG DETECTED!");
+
+  tft.setTextFont(1);
+  tft.setTextColor(fgColor, bgColor);
+  tft.setCursor(boxX + 16, boxY + 28);
+  char freqStr[20];
+  snprintf(freqStr, sizeof(freqStr), "Freq: %lu MHz",
+           (unsigned long)(kBugFreqList[sAlertFreqIdx] / 1000000));
+  tft.print(freqStr);
+  tft.printf(" %ddBm", sFreq[sAlertFreqIdx].peakRssi);
+}
+
+// --- Full Display Refresh ---------------------------------------------------
+
+static void bugDrawDisplay() {
+  if (sDisplayInvalid) {
+    bugClearContent(TFT_BLACK);
+    sDisplayInvalid = false;
+  }
+
+  // Title
+  tft.fillRect(0, 19, 240, 14, TFT_BLACK);
+  tft.setTextFont(1);
+  tft.setTextSize(1);
+  tft.setTextColor(UI_LABLE, TFT_BLACK);
+  tft.setCursor(2, kBugTitleY);
+  if (sDisplayMode == 0) {
+    tft.print("RF BUG DETECTOR - Bars");
+  } else {
+    tft.print("RF BUG DETECTOR - List");
+  }
+
+  // Sweep status on right
+  tft.setTextColor(UI_TEXT, TFT_BLACK);
+  tft.setCursor(170, kBugTitleY);
+  if (sAnyAlert) {
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.print("ALERT!");
+  } else {
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.print("CLEAR");
+  }
+
+  tft.drawFastHLine(0, 19, 240, UI_LINE);
+
+  if (sDisplayMode == 0) {
+    bugDrawBarGraph();
+  } else {
+    bugDrawList();
+  }
+
+  // Alert overlay on top
+  bugDrawAlertOverlay();
+}
+
+// --- Setup ------------------------------------------------------------------
+
+void bugDetectorSetup() {
+  pauseBackgroundRadioTasks();
+  setTouchButtonInputEnabled(true);
+
+  setTouchNavLabels("Rescan", "", "Exit", "", "");
+
+  bugClearContent(TFT_BLACK);
+  tft.setRotation(TFT_ROTATION);
+
+  drawStatusBar(readBatteryVoltage(), true);
+
+#if HAS_PCF8574_BUTTONS
+  pcf.pinMode(BTN_LEFT, INPUT_PULLUP);
+  pcf.pinMode(BTN_UP, INPUT_PULLUP);
+  pcf.pinMode(BTN_DOWN, INPUT_PULLUP);
+  pcf.pinMode(BTN_SELECT, INPUT_PULLUP);
+#endif
+
+  setupTouchscreen();
+
+  // Initialize state
+  for (uint8_t i = 0; i < kBugFreqCount; i++) {
+    sFreq[i].rssi           = -100;
+    sFreq[i].aboveThreshold = false;
+    sFreq[i].aboveStartMs   = 0;
+    sFreq[i].sustainMs      = 0;
+    sFreq[i].alerted        = false;
+    sFreq[i].peakRssi       = -100;
+  }
+
+  sLastSweepMs    = 0;
+  sDisplayMode    = 0;
+  sDisplayInvalid = true;
+  sAlertActive    = false;
+  sAnyAlert       = false;
+  sFlashOn        = true;
+  sFlashToggleMs  = 0;
+  sPrevLeft       = false;
+  sPrevUp         = false;
+  sPrevDown       = false;
+
+  // Initial sweep immediately
+  bugPerformSweep();
+  sLastSweepMs = millis();
+
+  sDisplayInvalid = true;
+  bugDrawDisplay();
+  redrawTouchButtonBar();
+}
+
+// --- Loop -------------------------------------------------------------------
+
+void bugDetectorLoop() {
+  // Exit check
+  if (feature_active && (isButtonPressed(BTN_SELECT) || featureExitButtonPressed())) {
+    feature_exit_requested = true;
+    return;
+  }
+
+  tft.drawFastHLine(0, 19, 240, UI_LINE);
+  updateStatusBar();
+  drawStatusBar(readBatteryVoltage(), true);
+
+  maintainTouchNavBar();
+
+  // --- Button handling ---
+  // BTN_LEFT = rescan
+  bool leftPressed = isButtonPressed(BTN_LEFT);
+  if (leftPressed && !sPrevLeft) {
+    // Force immediate rescan
+    bugPerformSweep();
+    sLastSweepMs = millis();
+    sDisplayInvalid = true;
+    delay(150);
+  }
+  sPrevLeft = leftPressed;
+
+  // Touch nav left = rescan
+  if (featureHasTouchNavBar() && isTouchNavButtonPressedEdge(BTN_LEFT)) {
+    bugPerformSweep();
+    sLastSweepMs = millis();
+    sDisplayInvalid = true;
+  }
+
+  // BTN_UP/DOWN = cycle display mode
+  bool upPressed = isButtonPressed(BTN_UP);
+  if (upPressed && !sPrevUp) {
+    sDisplayMode = (sDisplayMode + 1) % 2;
+    sDisplayInvalid = true;
+    delay(150);
+  }
+  sPrevUp = upPressed;
+
+  bool downPressed = isButtonPressed(BTN_DOWN);
+  if (downPressed && !sPrevDown) {
+    sDisplayMode = (sDisplayMode == 0) ? 1 : 0;
+    sDisplayInvalid = true;
+    delay(150);
+  }
+  sPrevDown = downPressed;
+
+  // Touch nav up/down also cycle mode
+  if (featureHasTouchNavBar() && isTouchNavButtonPressedEdge(BTN_UP)) {
+    sDisplayMode = (sDisplayMode + 1) % 2;
+    sDisplayInvalid = true;
+  }
+  if (featureHasTouchNavBar() && isTouchNavButtonPressedEdge(BTN_DOWN)) {
+    sDisplayMode = (sDisplayMode == 0) ? 1 : 0;
+    sDisplayInvalid = true;
+  }
+
+  // --- Auto-sweep every 2 seconds ---
+  uint32_t now = millis();
+  if ((now - sLastSweepMs) >= kBugSweepInterval) {
+    bugPerformSweep();
+    sLastSweepMs = now;
+  }
+
+  // --- Draw ---
+  bugDrawDisplay();
+
+  // Small delay to prevent excessive refresh
+  delay(30);
+}
+
+}  // namespace BugDetector
