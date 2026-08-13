@@ -148,6 +148,22 @@ namespace jammingdetector {
   void Setup();
   void Loop();
 }
+namespace RfCloner {
+  void rfClonerSetup();
+  void rfClonerLoop();
+}
+namespace BugDetector {
+  void bugDetectorSetup();
+  void bugDetectorLoop();
+}
+namespace DoorbellHijack {
+  void doorbellSetup();
+  void doorbellLoop();
+}
+namespace RemoteManager {
+  void remoteMgrSetup();
+  void remoteMgrLoop();
+}
 
 /* ───────────── WiFi namespaces ───────────── */
 namespace PacketMonitor {
@@ -201,6 +217,14 @@ namespace ArpScanner {
 namespace KarmaAttack {
   void karmaSetup();
   void karmaLoop();
+}
+namespace CameraDetector {
+  void camDetectorSetup();
+  void camDetectorLoop();
+}
+namespace HandshakeCapture {
+  void hsCaptureSetup();
+  void hsCaptureLoop();
 }
 namespace FirmwareUpdate {
   void updateSetup();
