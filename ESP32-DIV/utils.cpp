@@ -473,28 +473,46 @@ void requestStatusBarRedraw() {
 const float R1 = 100000.0;
 const float R2 = 100000.0;
 
+// IP5306 power management IC — battery percentage via I2C (ESP32-DIV v2).
+// The IP5306 drives 4 LEDs, so levels are in 25% increments only.
+// Returns -1 if the IC does not respond (I2C not ready / not present).
+int readIpBatteryPercent() {
+  Wire.beginTransmission(0x75);
+  Wire.write(0x78);
+  if (Wire.endTransmission(false) != 0) return -1;
+  if (Wire.requestFrom((int)0x75, 1) != 1) return -1;
+  switch (Wire.read() & 0xF0) {
+    case 0x00: return 100;
+    case 0x80: return 75;
+    case 0xC0: return 50;
+    case 0xE0: return 25;
+    default:   return 5;
+  }
+}
+
+// IP5306 charging status via I2C.
+// Register 0x70 bit3 = charging active, Register 0x71 bit3 = battery full.
+// Returns: 0 = not charging, 1 = charging, 2 = full, -1 = I2C error.
+int readIpChargeStatus() {
+  Wire.beginTransmission(0x75);
+  Wire.write(0x71);
+  if (Wire.endTransmission(false) != 0) return -1;
+  if (Wire.requestFrom((int)0x75, 1) != 1) return -1;
+  if (Wire.read() & (1 << 3)) return 2;  // full
+
+  Wire.beginTransmission(0x75);
+  Wire.write(0x70);
+  if (Wire.endTransmission(false) != 0) return -1;
+  if (Wire.requestFrom((int)0x75, 1) != 1) return -1;
+  if (Wire.read() & (1 << 3)) return 1;  // charging
+  return 0;  // not charging
+}
+
 float readBatteryVoltage()
 {
-  static bool adcInitialized = false;
-
-  if (!adcInitialized)
-  {
-    analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
-    adcInitialized = true;
-  }
-
-  const int sampleCount = 16;
-  uint32_t sum = 0;
-
-  for (int i = 0; i < sampleCount; i++)
-  {
-    sum += analogReadMilliVolts(BATTERY_ADC_PIN);
-    delayMicroseconds(500);
-  }
-
-  float avgMv = sum / (float)sampleCount;
-
-  return (avgMv / 1000.0f) * 2.0f;
+  int pct = readIpBatteryPercent();
+  if (pct < 0) return 0.0f;
+  return 3.0f + (pct / 100.0f) * 1.2f;
 }
 
 float readInternalTemperature() {
@@ -548,6 +566,7 @@ void drawStatusBar(float batteryVoltage, bool forceUpdate, bool bottomSeparator)
   static int lastSdSnap            = -1;
   static bool lastWardGpsIcon      = false;
   static uint32_t lastWardBlinkPhase = 0;
+  static int lastChargeStatus      = -1;
 
   int batteryPercentage = ::map(batteryVoltage * 100, 300, 420, 0, 100);
   batteryPercentage = constrain(batteryPercentage, 0, 100);
@@ -573,9 +592,11 @@ void drawStatusBar(float batteryVoltage, bool forceUpdate, bool bottomSeparator)
 
   const bool battCh =
       statusBarBatteryMeaningfulChange(batteryPercentage, lastBatteryPercentage, forceUpdate);
+  const int chargeStatus = readIpChargeStatus();
+  const bool chargeChanged = (chargeStatus != lastChargeStatus);
   const bool wardBlinkOnly =
       !forceUpdate && wardGpsIcon && lastWardGpsIcon &&
-      (wardBlinkPhase != lastWardBlinkPhase) && !battCh && wifiHalf == lastWifiHalf &&
+      (wardBlinkPhase != lastWardBlinkPhase) && !battCh && !chargeChanged && wifiHalf == lastWifiHalf &&
       bleHalf == lastBleHalf && tempBand == lastTempBand && sdSnap == lastSdSnap;
 
   if (wardBlinkOnly) {
@@ -599,7 +620,7 @@ void drawStatusBar(float batteryVoltage, bool forceUpdate, bool bottomSeparator)
     return;
   }
 
-  if (battCh || wifiHalf != lastWifiHalf || bleHalf != lastBleHalf || tempBand != lastTempBand ||
+  if (battCh || chargeChanged || wifiHalf != lastWifiHalf || bleHalf != lastBleHalf || tempBand != lastTempBand ||
       sdSnap != lastSdSnap || wardGpsIcon != lastWardGpsIcon ||
       (wardGpsIcon && wardBlinkPhase != lastWardBlinkPhase) || forceUpdate) {
     int barHeight = 20;
@@ -620,6 +641,16 @@ void drawStatusBar(float batteryVoltage, bool forceUpdate, bool bottomSeparator)
     tft.setTextFont(1);
     tft.setTextSize(1);
     tft.print(String(batteryPercentage) + "%");
+
+    // Charging indicator — read IP5306 charge status and show +/FULL
+    int chargeStatus = readIpChargeStatus();
+    if (chargeStatus == 1) {
+      tft.setTextColor(TFT_YELLOW, UI_LABLE);
+      tft.print("+");
+    } else if (chargeStatus == 2) {
+      tft.setTextColor(TFT_CYAN, UI_LABLE);
+      tft.print(" FULL");
+    }
 
     const int iconW         = 16;
     const int gap           = 3;
@@ -693,6 +724,7 @@ void drawStatusBar(float batteryVoltage, bool forceUpdate, bool bottomSeparator)
     lastSdSnap            = sdSnap;
     lastWardGpsIcon       = wardGpsIcon;
     lastWardBlinkPhase    = wardGpsIcon ? wardBlinkPhase : 0u;
+    lastChargeStatus      = chargeStatus;
   }
 }
 
